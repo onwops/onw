@@ -1,5 +1,7 @@
 // 🚀 REDIS CLOUD WebRTC Signaling Server (Based on Original)
 
+import { Redis } from '@upstash/redis';
+
 const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
@@ -26,157 +28,21 @@ const SIMPLE_STRATEGY_THRESHOLD = 10;
 const HYBRID_STRATEGY_THRESHOLD = 100;
 
 // ==========================================
-// EDGE-COMPATIBLE REDIS CLIENT
+// UPSTASH REDIS CLIENT
 // ==========================================
 
-class EdgeRedisClient {
-    constructor() {
-        if (!process.env.REDIS_URL) {
-            throw new Error('REDIS_URL environment variable is required');
-        }
-        this.parseRedisUrl();
-    }
-    
-    parseRedisUrl() {
-        try {
-            const url = process.env.REDIS_URL;
-            // redis://default:password@host:port
-            const parsed = new URL(url);
-            
-            this.host = parsed.hostname;
-            this.port = parsed.port || 6379;
-            this.password = parsed.password;
-            this.username = parsed.username || 'default';
-            
-            // For Redis Cloud, use HTTPS REST API
-            this.restUrl = `https://${this.host}:${this.port}`;
-            
-            criticalLog('REDIS-INIT', `Connected to Redis: ${this.host}:${this.port}`);
-        } catch (error) {
-            criticalLog('REDIS-ERROR', 'Invalid Redis URL:', error.message);
-            throw error;
-        }
-    }
-    
-    async executeCommand(command, ...args) {
-        try {
-            // For Redis Cloud, we need to use their REST API
-            const auth = btoa(`${this.username}:${this.password}`);
-            
-            const body = [command, ...args].map(arg => 
-                typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
-            );
-            
-            const response = await fetch(this.restUrl, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Basic ${auth}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(body)
-            });
-            
-            if (!response.ok) {
-                throw new Error(`Redis command failed: ${response.status} ${response.statusText}`);
-            }
-            
-            const result = await response.json();
-            return result.result;
-        } catch (error) {
-            criticalLog('REDIS-CMD-ERROR', command, error.message);
-            return null;
-        }
-    }
-    
-    // Redis commands
-    async get(key) {
-        const result = await this.executeCommand('GET', key);
-        return result;
-    }
-    
-    async set(key, value, options = {}) {
-        if (options.ex) {
-            return await this.executeCommand('SETEX', key, options.ex, value);
-        }
-        return await this.executeCommand('SET', key, value);
-    }
-    
-    async del(key) {
-        return await this.executeCommand('DEL', key);
-    }
-    
-    async hset(key, field, value) {
-        return await this.executeCommand('HSET', key, field, value);
-    }
-    
-    async hget(key, field) {
-        return await this.executeCommand('HGET', key, field);
-    }
-    
-    async hgetall(key) {
-        return await this.executeCommand('HGETALL', key);
-    }
-    
-    async hdel(key, field) {
-        return await this.executeCommand('HDEL', key, field);
-    }
-    
-    async sadd(key, ...members) {
-        return await this.executeCommand('SADD', key, ...members);
-    }
-    
-    async srem(key, ...members) {
-        return await this.executeCommand('SREM', key, ...members);
-    }
-    
-    async smembers(key) {
-        return await this.executeCommand('SMEMBERS', key) || [];
-    }
-    
-    async scard(key) {
-        return await this.executeCommand('SCARD', key) || 0;
-    }
-    
-    async lpush(key, ...values) {
-        return await this.executeCommand('LPUSH', key, ...values);
-    }
-    
-    async rpop(key) {
-        return await this.executeCommand('RPOP', key);
-    }
-    
-    async lrange(key, start, stop) {
-        return await this.executeCommand('LRANGE', key, start, stop) || [];
-    }
-    
-    async llen(key) {
-        return await this.executeCommand('LLEN', key) || 0;
-    }
-    
-    async ltrim(key, start, stop) {
-        return await this.executeCommand('LTRIM', key, start, stop);
-    }
-    
-    async incr(key) {
-        return await this.executeCommand('INCR', key);
-    }
-    
-    async decr(key) {
-        return await this.executeCommand('DECR', key);
-    }
-    
-    async expire(key, seconds) {
-        return await this.executeCommand('EXPIRE', key, seconds);
-    }
-}
-
-// Global Redis client instance
 let redisClient = null;
 
 function getRedisClient() {
-    if (!redisClient) {
+    if (!redisClient && process.env.REDIS_URL) {
         try {
-            redisClient = new EdgeRedisClient();
+            // Parse Redis URL for Upstash
+            const url = process.env.REDIS_URL;
+            redisClient = Redis.fromEnv({
+                url: url,
+                automaticDeserialization: false
+            });
+            criticalLog('REDIS-INIT', 'Redis client initialized');
         } catch (error) {
             criticalLog('REDIS-INIT-ERROR', error.message);
             return null;
@@ -224,7 +90,8 @@ async function getWaitingUsers() {
         const users = new Map();
         for (const [userId, userData] of Object.entries(data)) {
             try {
-                users.set(userId, JSON.parse(userData));
+                const parsedData = typeof userData === 'string' ? JSON.parse(userData) : userData;
+                users.set(userId, parsedData);
             } catch (e) {
                 criticalLog('PARSE-ERROR', 'Failed to parse user data for', userId);
             }
@@ -275,7 +142,8 @@ async function getActiveMatches() {
         const matches = new Map();
         for (const [matchId, matchData] of Object.entries(data)) {
             try {
-                matches.set(matchId, JSON.parse(matchData));
+                const parsedData = typeof matchData === 'string' ? JSON.parse(matchData) : matchData;
+                matches.set(matchId, parsedData);
             } catch (e) {
                 criticalLog('PARSE-ERROR', 'Failed to parse match data for', matchId);
             }
@@ -939,4 +807,3 @@ export default async function handler(req) {
     }
 }
 
-export const config = { runtime: 'edge' };
