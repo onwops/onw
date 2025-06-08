@@ -1,7 +1,7 @@
 {
   "name": "webrtc-signaling-server",
   "version": "1.0.0",
-  "description": "Redis-optimized WebRTC signaling server for Vercel Edge Runtime",
+  "description": "Redis Cloud WebRTC signaling server for Vercel Edge Runtime",
   "main": "api/signaling.js",
   "scripts": {
     "dev": "vercel dev",
@@ -10,10 +10,7 @@
     "deploy": "vercel --prod"
   },
   "dependencies": {
-    "@vercel/kv": "^1.0.1"
-  },
-  "devDependencies": {
-    "@vercel/node": "^3.0.0"
+    "@upstash/redis": "^1.25.1"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -27,9 +24,5 @@
     "serverless"
   ],
   "author": "Your Name",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "your-repo-url"
-  }
+  "license": "MIT"
 }
