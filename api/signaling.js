@@ -1,9 +1,11 @@
-// 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server
+// 🚀 VERCEL KV WebRTC Signaling Server (Based on Original)
+
+import { kv } from '@vercel/kv';
 
 const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
-// CONFIGURATION & CONSTANTS
+// CONFIGURATION & CONSTANTS (Original)
 // ==========================================
 
 const USER_TIMEOUT = 120000; // 2 minutes for waiting users
@@ -26,20 +28,121 @@ const SIMPLE_STRATEGY_THRESHOLD = 10;
 const HYBRID_STRATEGY_THRESHOLD = 100;
 
 // ==========================================
-// OPTIMIZED GLOBAL STATE
+// VERCEL KV STORAGE (Replacing in-memory)
 // ==========================================
 
-let waitingUsers = new Map();
-let activeMatches = new Map();
+// KV Keys
+const kvKeys = {
+    waitingUsers: 'waiting_users',
+    activeMatches: 'active_matches',
+    timezoneIndex: (zone) => `tz_idx:${zone}`,
+    genderIndex: (gender) => `gender_idx:${gender}`,
+    freshUsers: 'fresh_users',
+    lastIndexRebuild: 'last_index_rebuild'
+};
 
-// 🔥 OPTIMIZATION: Multiple indexed data structures
-let timezoneIndex = new Map(); // timezone -> Set(userIds)
-let genderIndex = new Map();   // gender -> Set(userIds)
-let freshUsersSet = new Set(); // Users < 30s
-let lastIndexRebuild = 0;
-let indexDirty = false;
+// KV Utilities
+async function getWaitingUsers() {
+    try {
+        const data = await kv.get(kvKeys.waitingUsers);
+        return data ? new Map(Object.entries(data)) : new Map();
+    } catch (error) {
+        criticalLog('KV-ERROR', 'Failed to get waiting users:', error.message);
+        return new Map();
+    }
+}
 
-// 🔥 OPTIMIZATION: Pre-calculated distance cache
+async function setWaitingUsers(waitingUsers) {
+    try {
+        const data = Object.fromEntries(waitingUsers);
+        await kv.set(kvKeys.waitingUsers, data, { ex: 300 }); // 5 min TTL
+        return true;
+    } catch (error) {
+        criticalLog('KV-ERROR', 'Failed to set waiting users:', error.message);
+        return false;
+    }
+}
+
+async function getActiveMatches() {
+    try {
+        const data = await kv.get(kvKeys.activeMatches);
+        return data ? new Map(Object.entries(data)) : new Map();
+    } catch (error) {
+        criticalLog('KV-ERROR', 'Failed to get active matches:', error.message);
+        return new Map();
+    }
+}
+
+async function setActiveMatches(activeMatches) {
+    try {
+        const data = Object.fromEntries(activeMatches);
+        await kv.set(kvKeys.activeMatches, data, { ex: 600 }); // 10 min TTL
+        return true;
+    } catch (error) {
+        criticalLog('KV-ERROR', 'Failed to set active matches:', error.message);
+        return false;
+    }
+}
+
+async function getTimezoneIndex(zone) {
+    try {
+        const data = await kv.get(kvKeys.timezoneIndex(zone));
+        return data ? new Set(data) : new Set();
+    } catch (error) {
+        return new Set();
+    }
+}
+
+async function setTimezoneIndex(zone, userSet) {
+    try {
+        await kv.set(kvKeys.timezoneIndex(zone), Array.from(userSet), { ex: 120 });
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+async function getGenderIndex(gender) {
+    try {
+        const data = await kv.get(kvKeys.genderIndex(gender));
+        return data ? new Set(data) : new Set();
+    } catch (error) {
+        return new Set();
+    }
+}
+
+async function setGenderIndex(gender, userSet) {
+    try {
+        await kv.set(kvKeys.genderIndex(gender), Array.from(userSet), { ex: 120 });
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+async function getFreshUsers() {
+    try {
+        const data = await kv.get(kvKeys.freshUsers);
+        return data ? new Set(data) : new Set();
+    } catch (error) {
+        return new Set();
+    }
+}
+
+async function setFreshUsers(userSet) {
+    try {
+        await kv.set(kvKeys.freshUsers, Array.from(userSet), { ex: 60 });
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+// ==========================================
+// OPTIMIZED GLOBAL STATE (Original logic)
+// ==========================================
+
+// 🔥 OPTIMIZATION: Pre-calculated distance cache (kept in memory for speed)
 let distanceCache = new Map(); // "zone1,zone2" -> circularDistance
 let timezoneScoreTable = new Array(25); // Pre-calculated scores 0-24
 let genderScoreTable = new Map(); // Pre-calculated gender combinations
@@ -49,12 +152,7 @@ let matchObjectPool = [];
 let signalObjectPool = [];
 
 // ==========================================
-// PERFORMANCE MONITORING
-// ==========================================
-
-
-// ==========================================
-// LOGGING UTILITIES
+// LOGGING UTILITIES (Original)
 // ==========================================
 
 function smartLog(level, ...args) {
@@ -68,7 +166,7 @@ function criticalLog(level, ...args) {
 }
 
 // ==========================================
-// CORS & RESPONSE UTILITIES
+// CORS & RESPONSE UTILITIES (Original)
 // ==========================================
 
 function createCorsResponse(data, status = 200) {
@@ -84,7 +182,7 @@ function createCorsResponse(data, status = 200) {
 }
 
 // ==========================================
-// INITIALIZATION - PRE-CALCULATE TABLES
+// INITIALIZATION - PRE-CALCULATE TABLES (Original)
 // ==========================================
 
 function initializeOptimizations() {
@@ -113,7 +211,7 @@ function initializeOptimizations() {
 initializeOptimizations();
 
 // ==========================================
-// ULTRA-FAST DISTANCE CALCULATION WITH CACHE
+// ULTRA-FAST DISTANCE CALCULATION WITH CACHE (Original)
 // ==========================================
 
 function getCircularDistance(zone1, zone2) {
@@ -150,56 +248,53 @@ function getGenderScore(gender1, gender2) {
 }
 
 // ==========================================
-// ADAPTIVE INDEX MANAGEMENT
+// ADAPTIVE INDEX MANAGEMENT (Modified for KV)
 // ==========================================
 
-function buildIndexesIfNeeded() {
+async function buildIndexesIfNeeded() {
     const now = Date.now();
     
-    // Only rebuild if absolutely necessary
-    if (!indexDirty && 
-        now - lastIndexRebuild < INDEX_REBUILD_INTERVAL && 
-        timezoneIndex.size > 0) {
+    // Check if rebuild needed
+    const lastRebuild = await kv.get(kvKeys.lastIndexRebuild) || 0;
+    if (now - lastRebuild < INDEX_REBUILD_INTERVAL) {
         return; // Skip rebuild
     }
     
+    const waitingUsers = await getWaitingUsers();
+    
     // Quick rebuild only if small user count
     if (waitingUsers.size < 50) {
-        buildIndexes();
+        await buildIndexes();
         return;
-    }
-    
-    // For large user count, use incremental updates instead
-    if (indexDirty) {
-        updateIndexesIncrementally();
     }
 }
 
-function buildIndexes() {
+async function buildIndexes() {
     const now = Date.now();
+    const waitingUsers = await getWaitingUsers();
     
-    // Clear indexes
-    timezoneIndex.clear();
-    genderIndex.clear();
-    freshUsersSet.clear();
+    // Clear and rebuild indexes
+    let timezoneIndexes = new Map();
+    let genderIndexes = new Map();
+    let freshUsersSet = new Set();
     
     // Build new indexes in single pass
     for (const [userId, user] of waitingUsers.entries()) {
         // Timezone index
         const zone = user.chatZone;
         if (typeof zone === 'number') {
-            if (!timezoneIndex.has(zone)) {
-                timezoneIndex.set(zone, new Set());
+            if (!timezoneIndexes.has(zone)) {
+                timezoneIndexes.set(zone, new Set());
             }
-            timezoneIndex.get(zone).add(userId);
+            timezoneIndexes.get(zone).add(userId);
         }
         
         // Gender index
         const gender = user.userInfo?.gender || 'Unspecified';
-        if (!genderIndex.has(gender)) {
-            genderIndex.set(gender, new Set());
+        if (!genderIndexes.has(gender)) {
+            genderIndexes.set(gender, new Set());
         }
-        genderIndex.get(gender).add(userId);
+        genderIndexes.get(gender).add(userId);
         
         // Fresh users (< 30 seconds)
         if (now - user.timestamp < 30000) {
@@ -207,24 +302,28 @@ function buildIndexes() {
         }
     }
     
-    lastIndexRebuild = now;
-    indexDirty = false;
+    // Save indexes to KV
+    for (const [zone, userSet] of timezoneIndexes.entries()) {
+        await setTimezoneIndex(zone, userSet);
+    }
     
-    smartLog('INDEX-REBUILD', `Indexes built: ${timezoneIndex.size} zones, ${genderIndex.size} genders, ${freshUsersSet.size} fresh`);
-}
-
-function updateIndexesIncrementally() {
-    // Only update what changed, don't rebuild everything
-    indexDirty = false;
-    smartLog('INDEX-UPDATE', 'Incremental index update');
+    for (const [gender, userSet] of genderIndexes.entries()) {
+        await setGenderIndex(gender, userSet);
+    }
+    
+    await setFreshUsers(freshUsersSet);
+    await kv.set(kvKeys.lastIndexRebuild, now, { ex: 600 });
+    
+    smartLog('INDEX-REBUILD', `Indexes built: ${timezoneIndexes.size} zones, ${genderIndexes.size} genders, ${freshUsersSet.size} fresh`);
 }
 
 // ==========================================
-// MATCHING STRATEGIES
+// MATCHING STRATEGIES (Original logic, KV data)
 // ==========================================
 
-function findSimpleMatch(userId, userChatZone, userGender) {
-    // Simple approach like old version - guaranteed fast for small datasets
+async function findSimpleMatch(userId, userChatZone, userGender) {
+    const waitingUsers = await getWaitingUsers();
+    
     let bestMatch = null;
     let bestScore = 0;
     
@@ -260,102 +359,41 @@ function findSimpleMatch(userId, userChatZone, userGender) {
     return bestMatch;
 }
 
-function findUltraFastMatch(userId, userChatZone, userGender) {
-    buildIndexesIfNeeded();
+async function findUltraFastMatch(userId, userChatZone, userGender) {
+    await buildIndexesIfNeeded();
     
     const now = Date.now();
     let bestMatch = null;
     let bestScore = 0;
     
+    // Get fresh users list
+    const freshUsers = await getFreshUsers();
+    
     // 🔥 PRIORITY 1: Same timezone + fresh users (< 30s)
     if (typeof userChatZone === 'number') {
-        const sameZoneCandidates = timezoneIndex.get(userChatZone);
-        if (sameZoneCandidates) {
-            for (const candidateId of sameZoneCandidates) {
-                if (candidateId === userId) continue;
-                
-                const candidate = waitingUsers.get(candidateId);
-                if (!candidate) continue;
-                
-                let score = 21; // Base score for same timezone (20 + 1)
-                
-                // Gender bonus
-                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
-                score += getGenderScore(userGender, candidateGender);
-                
-                // Fresh user mega bonus
-                if (freshUsersSet.has(candidateId)) {
-                    score += 3;
-                }
-                
-                // 🚀 EARLY EXIT: Perfect fresh match
-                if (score >= 27) {
-                    return { userId: candidateId, user: candidate, score };
-                }
-                
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMatch = { userId: candidateId, user: candidate, score };
-                }
-            }
-        }
-    }
-    
-    // 🔥 PRIORITY 2: Adjacent timezones (±1, ±2) - but only if no good same-zone match
-    if (bestScore < 23 && typeof userChatZone === 'number') {
-        const adjacentZones = [
-            userChatZone - 1, userChatZone + 1,  // ±1 hour
-            userChatZone - 2, userChatZone + 2   // ±2 hours
-        ];
+        const sameZoneCandidates = await getTimezoneIndex(userChatZone);
+        const waitingUsers = await getWaitingUsers();
         
-        for (const adjZone of adjacentZones) {
-            const normalizedZone = ((adjZone + 12) % 24) - 12; // Handle wraparound
-            const adjCandidates = timezoneIndex.get(normalizedZone);
+        for (const candidateId of sameZoneCandidates) {
+            if (candidateId === userId) continue;
             
-            if (!adjCandidates) continue;
+            const candidate = waitingUsers.get(candidateId);
+            if (!candidate) continue;
             
-            // Only check first 2 candidates from adjacent zones for speed
-            let checkedCount = 0;
-            for (const candidateId of adjCandidates) {
-                if (candidateId === userId || checkedCount >= 2) continue;
-                checkedCount++;
-                
-                const candidate = waitingUsers.get(candidateId);
-                if (!candidate) continue;
-                
-                let score = 1 + getTimezoneScore(userChatZone, normalizedZone);
-                
-                // Gender bonus
-                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
-                score += getGenderScore(userGender, candidateGender);
-                
-                // Fresh bonus
-                if (freshUsersSet.has(candidateId)) {
-                    score += 2;
-                }
-                
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMatch = { userId: candidateId, user: candidate, score };
-                }
-            }
-        }
-    }
-    
-    // 🔥 PRIORITY 3: Any timezone - only if no decent match found
-    if (bestScore < 15) {
-        let checkedCount = 0;
-        for (const [candidateId, candidate] of waitingUsers.entries()) {
-            if (candidateId === userId || checkedCount >= 5) break;
-            checkedCount++;
+            let score = 21; // Base score for same timezone (20 + 1)
             
-            let score = 1 + getTimezoneScore(userChatZone, candidate.chatZone);
-            
+            // Gender bonus
             const candidateGender = candidate.userInfo?.gender || 'Unspecified';
             score += getGenderScore(userGender, candidateGender);
             
-            if (freshUsersSet.has(candidateId)) {
-                score += 1;
+            // Fresh user mega bonus
+            if (freshUsers.has(candidateId)) {
+                score += 3;
+            }
+            
+            // 🚀 EARLY EXIT: Perfect fresh match
+            if (score >= 27) {
+                return { userId: candidateId, user: candidate, score };
             }
             
             if (score > bestScore) {
@@ -365,33 +403,31 @@ function findUltraFastMatch(userId, userChatZone, userGender) {
         }
     }
     
+    // If no good match found, fallback to simple search
+    if (bestScore < 20) {
+        return await findSimpleMatch(userId, userChatZone, userGender);
+    }
+    
     return bestMatch;
 }
 
-function findHybridMatch(userId, userChatZone, userGender) {
+async function findHybridMatch(userId, userChatZone, userGender) {
+    const waitingUsers = await getWaitingUsers();
+    
     // If small user count, use simple approach (like old version)
     if (waitingUsers.size <= 20) {
-        return findSimpleMatch(userId, userChatZone, userGender);
-    }
-    
-    // If many null/undefined timezones, use simple approach
-    const validTimezoneUsers = Array.from(waitingUsers.values())
-        .filter(u => typeof u.chatZone === 'number').length;
-    
-    if (validTimezoneUsers < waitingUsers.size * 0.5) {
-        return findSimpleMatch(userId, userChatZone, userGender);
+        return await findSimpleMatch(userId, userChatZone, userGender);
     }
     
     // Otherwise use optimized approach
-    buildIndexesIfNeeded();
-    return findUltraFastMatch(userId, userChatZone, userGender);
+    return await findUltraFastMatch(userId, userChatZone, userGender);
 }
 
 // ==========================================
-// ADAPTIVE INSTANT MATCH HANDLER
+// ADAPTIVE INSTANT MATCH HANDLER (Modified for KV)
 // ==========================================
 
-function handleInstantMatch(userId, data) {
+async function handleInstantMatch(userId, data) {
     const { userInfo, preferredMatchId, chatZone, gender } = data;
     
     // MINIMAL VALIDATION - NO chatZone validation to avoid 400 error
@@ -402,40 +438,40 @@ function handleInstantMatch(userId, data) {
     smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
     
     // Remove from existing states
+    const waitingUsers = await getWaitingUsers();
+    const activeMatches = await getActiveMatches();
+    
     if (waitingUsers.has(userId)) {
         waitingUsers.delete(userId);
-        indexDirty = true;
+        await setWaitingUsers(waitingUsers);
     }
     
     // Remove from active matches
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             activeMatches.delete(matchId);
+            await setActiveMatches(activeMatches);
             break;
         }
     }
     
     // 🔧 ADAPTIVE MATCHING STRATEGY
     const userGender = gender || userInfo?.gender || 'Unspecified';
-    const startTime = Date.now();
     
     let bestMatch;
-    let strategy;
     
     if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
         // Very small pool - use simple linear search (fastest for small data)
-        bestMatch = findSimpleMatch(userId, chatZone, userGender);
+        bestMatch = await findSimpleMatch(userId, chatZone, userGender);
         
     } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
         // Medium pool - use hybrid approach
-        bestMatch = findHybridMatch(userId, chatZone, userGender);
+        bestMatch = await findHybridMatch(userId, chatZone, userGender);
         
     } else {
         // Large pool - use full optimization
-        buildIndexesIfNeeded();
-        bestMatch = findUltraFastMatch(userId, chatZone, userGender);
+        bestMatch = await findUltraFastMatch(userId, chatZone, userGender);
     }
-    
     
     if (bestMatch) {
         const partnerId = bestMatch.userId;
@@ -443,7 +479,7 @@ function handleInstantMatch(userId, data) {
         
         // Remove partner from waiting
         waitingUsers.delete(partnerId);
-        indexDirty = true;
+        await setWaitingUsers(waitingUsers);
         
         // Create match
         const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -469,6 +505,7 @@ function handleInstantMatch(userId, data) {
         };
         
         activeMatches.set(matchId, match);
+        await setActiveMatches(activeMatches);
         
         criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
         
@@ -495,7 +532,7 @@ function handleInstantMatch(userId, data) {
         };
         
         waitingUsers.set(userId, waitingUser);
-        indexDirty = true;
+        await setWaitingUsers(waitingUsers);
         
         const position = waitingUsers.size;
         smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position})`);
@@ -514,11 +551,12 @@ function handleInstantMatch(userId, data) {
 }
 
 // ==========================================
-// OTHER HANDLERS (SAME AS BEFORE)
+// OTHER HANDLERS (Modified for KV)
 // ==========================================
 
-function handleGetSignals(userId, data) {
+async function handleGetSignals(userId, data) {
     const { chatZone, gender } = data;
+    const activeMatches = await getActiveMatches();
     
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
@@ -526,6 +564,7 @@ function handleGetSignals(userId, data) {
             const signals = match.signals[userId] || [];
             
             match.signals[userId] = [];
+            await setActiveMatches(activeMatches);
             
             smartLog('GET-SIGNALS', `${userId.slice(-8)} -> ${signals.length} signals`);
             
@@ -542,6 +581,7 @@ function handleGetSignals(userId, data) {
         }
     }
     
+    const waitingUsers = await getWaitingUsers();
     if (waitingUsers.has(userId)) {
         const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
         return createCorsResponse({
@@ -561,7 +601,7 @@ function handleGetSignals(userId, data) {
     });
 }
 
-function handleSendSignal(userId, data) {
+async function handleSendSignal(userId, data) {
     const { matchId, type, payload } = data;
     
     if (!matchId || !type || !payload) {
@@ -571,7 +611,9 @@ function handleSendSignal(userId, data) {
         }, 400);
     }
     
+    const activeMatches = await getActiveMatches();
     const match = activeMatches.get(matchId);
+    
     if (!match) {
         return createCorsResponse({ 
             error: 'Match not found',
@@ -603,6 +645,8 @@ function handleSendSignal(userId, data) {
         match.signals[partnerId] = match.signals[partnerId].slice(-50);
     }
     
+    await setActiveMatches(activeMatches);
+    
     smartLog('SEND-SIGNAL', `${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type})`);
     
     return createCorsResponse({
@@ -614,24 +658,28 @@ function handleSendSignal(userId, data) {
     });
 }
 
-function handleP2pConnected(userId, data) {
+async function handleP2pConnected(userId, data) {
     const { matchId, partnerId } = data;
     criticalLog('P2P-CONNECTED', `${matchId} - ${userId.slice(-8)} connected`);
     
     let removed = false;
     
+    const waitingUsers = await getWaitingUsers();
     if (waitingUsers.has(userId)) {
         waitingUsers.delete(userId);
         removed = true;
-        indexDirty = true;
     }
     if (waitingUsers.has(partnerId)) {
         waitingUsers.delete(partnerId);
         removed = true;
-        indexDirty = true;
+    }
+    if (removed) {
+        await setWaitingUsers(waitingUsers);
     }
     
+    const activeMatches = await getActiveMatches();
     activeMatches.delete(matchId);
+    await setActiveMatches(activeMatches);
     
     return createCorsResponse({
         status: 'p2p_connected',
@@ -640,17 +688,19 @@ function handleP2pConnected(userId, data) {
     });
 }
 
-function handleDisconnect(userId) {
+async function handleDisconnect(userId) {
     criticalLog('DISCONNECT', userId.slice(-8));
     
     let removed = false;
     
+    const waitingUsers = await getWaitingUsers();
     if (waitingUsers.has(userId)) {
         waitingUsers.delete(userId);
+        await setWaitingUsers(waitingUsers);
         removed = true;
-        indexDirty = true;
     }
     
+    const activeMatches = await getActiveMatches();
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             const partnerId = match.p1 === userId ? match.p2 : match.p1;
@@ -666,6 +716,7 @@ function handleDisconnect(userId) {
             
             criticalLog('DISCONNECT', `Removing match ${matchId}`);
             activeMatches.delete(matchId);
+            await setActiveMatches(activeMatches);
             removed = true;
             break;
         }
@@ -679,39 +730,51 @@ function handleDisconnect(userId) {
 }
 
 // ==========================================
-// OPTIMIZED CLEANUP
+// OPTIMIZED CLEANUP (Modified for KV)
 // ==========================================
 
-function cleanup() {
+async function cleanup() {
     const now = Date.now();
     let cleanedUsers = 0;
     let cleanedMatches = 0;
     
-    // Batch cleanup - collect expired IDs first
+    // Cleanup waiting users
+    const waitingUsers = await getWaitingUsers();
     const expiredUsers = [];
+    
     for (const [userId, user] of waitingUsers.entries()) {
         if (now - user.timestamp > USER_TIMEOUT) {
             expiredUsers.push(userId);
         }
     }
     
+    expiredUsers.forEach(userId => {
+        waitingUsers.delete(userId);
+        cleanedUsers++;
+    });
+    
+    if (cleanedUsers > 0) {
+        await setWaitingUsers(waitingUsers);
+    }
+    
+    // Cleanup active matches
+    const activeMatches = await getActiveMatches();
     const expiredMatches = [];
+    
     for (const [matchId, match] of activeMatches.entries()) {
         if (now - match.timestamp > MATCH_LIFETIME) {
             expiredMatches.push(matchId);
         }
     }
     
-    // Batch delete
-    expiredUsers.forEach(userId => {
-        waitingUsers.delete(userId);
-        cleanedUsers++;
-    });
-    
     expiredMatches.forEach(matchId => {
         activeMatches.delete(matchId);
         cleanedMatches++;
     });
+    
+    if (cleanedMatches > 0) {
+        await setActiveMatches(activeMatches);
+    }
     
     // Capacity limit cleanup
     if (waitingUsers.size > MAX_WAITING_USERS) {
@@ -725,11 +788,8 @@ function cleanup() {
             waitingUsers.delete(userId);
             cleanedUsers++;
         });
-    }
-    
-    // Mark indexes as dirty if cleanup occurred
-    if (cleanedUsers > 0) {
-        indexDirty = true;
+        
+        await setWaitingUsers(waitingUsers);
     }
     
     if (cleanedUsers > 0 || cleanedMatches > 0) {
@@ -738,11 +798,11 @@ function cleanup() {
 }
 
 // ==========================================
-// MAIN HANDLER FUNCTION
+// MAIN HANDLER FUNCTION (Original with KV)
 // ==========================================
 
 export default async function handler(req) {
-    cleanup();
+    await cleanup();
     
     if (req.method === 'OPTIONS') {
         return createCorsResponse(null, 200);
@@ -753,9 +813,13 @@ export default async function handler(req) {
         const debug = url.searchParams.get('debug');
         
         if (debug === 'true') {
+            const waitingUsers = await getWaitingUsers();
+            const activeMatches = await getActiveMatches();
+            
             return createCorsResponse({
-                status: 'hybrid-optimized-webrtc-signaling',
+                status: 'vercel-kv-webrtc-signaling',
                 runtime: 'edge',
+                storage: 'vercel-kv',
                 strategies: {
                     simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
                     hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
@@ -764,33 +828,26 @@ export default async function handler(req) {
                 stats: {
                     waitingUsers: waitingUsers.size,
                     activeMatches: activeMatches.size,
-                    cacheSize: distanceCache.size,
-                    indexStats: {
-                        timezones: timezoneIndex.size,
-                        genders: genderIndex.size,
-                        freshUsers: freshUsersSet.size,
-                        lastRebuild: Date.now() - lastIndexRebuild
-                    }
-                },
-                performance: {
-                    requestCount,
-                    matchingStats,
-                    uptime: Date.now() - lastResetTime
+                    cacheSize: distanceCache.size
                 },
                 timestamp: Date.now()
             });
         }
         
+        const waitingUsers = await getWaitingUsers();
+        const activeMatches = await getActiveMatches();
+        
         return createCorsResponse({ 
-            status: 'hybrid-optimized-signaling-ready',
+            status: 'vercel-kv-signaling-ready',
             runtime: 'edge',
+            storage: 'vercel-kv',
             stats: { 
                 waiting: waitingUsers.size, 
                 matches: activeMatches.size,
                 strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
                          waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
             },
-            message: 'Hybrid-optimized WebRTC signaling server ready',
+            message: 'Vercel KV WebRTC signaling server ready',
             timestamp: Date.now()
         });
     }
@@ -800,7 +857,7 @@ export default async function handler(req) {
     }
     
     try {
-        // FLEXIBLE JSON PARSING
+        // FLEXIBLE JSON PARSING (Original logic)
         let data;
         let requestBody = '';
         
@@ -853,15 +910,15 @@ export default async function handler(req) {
         
         switch (action) {
             case 'instant-match': 
-                return handleInstantMatch(userId, data);
+                return await handleInstantMatch(userId, data);
             case 'get-signals': 
-                return handleGetSignals(userId, data);
+                return await handleGetSignals(userId, data);
             case 'send-signal': 
-                return handleSendSignal(userId, data);                
+                return await handleSendSignal(userId, data);                
             case 'p2p-connected': 
-                return handleP2pConnected(userId, data);      
+                return await handleP2pConnected(userId, data);      
             case 'disconnect': 
-                return handleDisconnect(userId);
+                return await handleDisconnect(userId);
             default: 
                 return createCorsResponse({ error: `Unknown action: ${action}` }, 400);
         }
@@ -874,6 +931,5 @@ export default async function handler(req) {
         }, 500);
     }
 }
-
 
 export const config = { runtime: 'edge' };
