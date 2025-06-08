@@ -1,7 +1,7 @@
 {
   "name": "webrtc-signaling-server",
   "version": "1.0.0",
-  "description": "Memory-based WebRTC signaling server for Vercel Edge Runtime",
+  "description": "Redis-optimized WebRTC signaling server for Vercel Edge Runtime",
   "main": "api/signaling.js",
   "scripts": {
     "dev": "vercel dev",
@@ -9,17 +9,27 @@
     "start": "vercel dev",
     "deploy": "vercel --prod"
   },
+  "dependencies": {
+    "@vercel/kv": "^1.0.1"
+  },
+  "devDependencies": {
+    "@vercel/node": "^3.0.0"
+  },
   "engines": {
     "node": ">=18.0.0"
   },
   "keywords": [
     "webrtc",
     "signaling",
-    "memory",
+    "redis",
     "vercel",
     "edge-runtime",
     "serverless"
   ],
   "author": "Your Name",
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "your-repo-url"
+  }
 }
