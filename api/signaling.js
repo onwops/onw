@@ -1,4 +1,4 @@
-// 🚀 REDIS-OPTIMIZED WebRTC Signaling Server
+// 🚀 EDGE-COMPATIBLE Redis WebRTC Signaling Server
 
 const ENABLE_DETAILED_LOGGING = false;
 
@@ -13,13 +13,10 @@ const MAX_WAITING_USERS = 120000; // Prevent memory bloat
 // Timezone scoring constants
 const TIMEZONE_MAX_SCORE = 20;
 const TIMEZONE_PENALTY = 1;
-const TIMEZONE_CIRCLE_HOURS = 24;
 
 // Performance constants
-const INDEX_REBUILD_INTERVAL = 10000; // 10 seconds
 const MAX_CACHE_SIZE = 1000;
-const MATCH_CACHE_TTL = 5000; // 5 seconds
-const MAX_CANDIDATES = 5; // Reduced from 10
+const MAX_CANDIDATES = 5;
 
 // Adaptive strategy thresholds
 const SIMPLE_STRATEGY_THRESHOLD = 10;
@@ -32,24 +29,121 @@ const SIGNAL_TTL = 300; // 5 minutes
 const INDEX_TTL = 60; // 1 minute for indexes
 
 // ==========================================
-// REDIS CONNECTION
+// EDGE-COMPATIBLE REDIS CLIENT
 // ==========================================
 
-import { createClient } from 'redis';
+class EdgeRedisClient {
+    constructor(url) {
+        this.url = url;
+        this.parseRedisUrl();
+    }
+    
+    parseRedisUrl() {
+        try {
+            const parsed = new URL(this.url);
+            this.host = parsed.hostname;
+            this.port = parsed.port || 6379;
+            this.password = parsed.password;
+            this.baseUrl = `https://${this.host}:${this.port}`;
+        } catch (error) {
+            criticalLog('REDIS-ERROR', 'Invalid Redis URL:', error.message);
+            throw error;
+        }
+    }
+    
+    async executeCommand(command, ...args) {
+        try {
+            const body = [command, ...args].map(arg => 
+                typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
+            );
+            
+            const response = await fetch(`${this.baseUrl}`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.password}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+            
+            if (!response.ok) {
+                throw new Error(`Redis command failed: ${response.status}`);
+            }
+            
+            const result = await response.json();
+            return result.result;
+        } catch (error) {
+            criticalLog('REDIS-CMD-ERROR', command, error.message);
+            return null;
+        }
+    }
+    
+    // Basic Redis commands for Edge Runtime
+    async get(key) {
+        return await this.executeCommand('GET', key);
+    }
+    
+    async set(key, value, options = {}) {
+        if (options.EX) {
+            return await this.executeCommand('SETEX', key, options.EX, value);
+        }
+        return await this.executeCommand('SET', key, value);
+    }
+    
+    async del(key) {
+        return await this.executeCommand('DEL', key);
+    }
+    
+    async sadd(key, ...members) {
+        return await this.executeCommand('SADD', key, ...members);
+    }
+    
+    async srem(key, ...members) {
+        return await this.executeCommand('SREM', key, ...members);
+    }
+    
+    async smembers(key) {
+        return await this.executeCommand('SMEMBERS', key) || [];
+    }
+    
+    async scard(key) {
+        return await this.executeCommand('SCARD', key) || 0;
+    }
+    
+    async lpush(key, ...values) {
+        return await this.executeCommand('LPUSH', key, ...values);
+    }
+    
+    async lrange(key, start, stop) {
+        return await this.executeCommand('LRANGE', key, start, stop) || [];
+    }
+    
+    async llen(key) {
+        return await this.executeCommand('LLEN', key) || 0;
+    }
+    
+    async ltrim(key, start, stop) {
+        return await this.executeCommand('LTRIM', key, start, stop);
+    }
+    
+    async incr(key) {
+        return await this.executeCommand('INCR', key);
+    }
+    
+    async decr(key) {
+        return await this.executeCommand('DECR', key);
+    }
+    
+    async expire(key, seconds) {
+        return await this.executeCommand('EXPIRE', key, seconds);
+    }
+}
 
 let redisClient = null;
 
-async function getRedisClient() {
-    if (!redisClient) {
-        redisClient = createClient({
-            url: process.env.REDIS_URL
-        });
-        
-        redisClient.on('error', (err) => {
-            console.error('Redis Client Error', err);
-        });
-        
-        await redisClient.connect();
+function getRedisClient() {
+    if (!redisClient && process.env.REDIS_URL) {
+        redisClient = new EdgeRedisClient(process.env.REDIS_URL);
     }
     return redisClient;
 }
@@ -60,7 +154,11 @@ async function getRedisClient() {
 
 async function safeRedisOp(operation) {
     try {
-        const redis = await getRedisClient();
+        const redis = getRedisClient();
+        if (!redis) {
+            criticalLog('REDIS-ERROR', 'Redis client not available');
+            return null;
+        }
         return await operation(redis);
     } catch (error) {
         criticalLog('REDIS-ERROR', error.message);
@@ -83,10 +181,17 @@ const keys = {
 };
 
 // ==========================================
-// OPTIMIZED GLOBAL STATE (Redis-backed)
+// IN-MEMORY FALLBACK
 // ==========================================
 
-// Pre-calculated distance cache (kept in memory for speed)
+// Fallback to in-memory if Redis fails
+let memoryWaitingUsers = new Map();
+let memoryActiveMatches = new Map();
+
+// ==========================================
+// OPTIMIZED GLOBAL STATE
+// ==========================================
+
 let distanceCache = new Map();
 let timezoneScoreTable = new Array(25);
 let genderScoreTable = new Map();
@@ -122,7 +227,7 @@ function createCorsResponse(data, status = 200) {
 }
 
 // ==========================================
-// INITIALIZATION - PRE-CALCULATE TABLES
+// INITIALIZATION
 // ==========================================
 
 function initializeOptimizations() {
@@ -151,13 +256,12 @@ function initializeOptimizations() {
 initializeOptimizations();
 
 // ==========================================
-// ULTRA-FAST DISTANCE CALCULATION WITH CACHE
+// DISTANCE CALCULATION
 // ==========================================
 
 function getCircularDistance(zone1, zone2) {
     if (typeof zone1 !== 'number' || typeof zone2 !== 'number') return 12;
     
-    // Cache key (normalized)
     const cacheKey = zone1 <= zone2 ? `${zone1},${zone2}` : `${zone2},${zone1}`;
     
     if (distanceCache.has(cacheKey)) {
@@ -167,7 +271,6 @@ function getCircularDistance(zone1, zone2) {
     const linear = Math.abs(zone1 - zone2);
     const circular = linear > 12 ? 24 - linear : linear;
     
-    // Add to cache with LRU eviction
     if (distanceCache.size >= MAX_CACHE_SIZE) {
         const firstKey = distanceCache.keys().next().value;
         distanceCache.delete(firstKey);
@@ -188,263 +291,129 @@ function getGenderScore(gender1, gender2) {
 }
 
 // ==========================================
-// REDIS WAITING USERS OPERATIONS
+// HYBRID STORAGE OPERATIONS
 // ==========================================
 
 async function addWaitingUser(userId, userInfo, chatZone) {
-    return await safeRedisOp(async (redis) => {
-        const user = {
-            userId,
-            userInfo: userInfo || {},
-            chatZone: chatZone || null,
-            timestamp: Date.now()
-        };
+    const user = {
+        userId,
+        userInfo: userInfo || {},
+        chatZone: chatZone || null,
+        timestamp: Date.now()
+    };
+    
+    // Try Redis first, fallback to memory
+    const redisSuccess = await safeRedisOp(async (redis) => {
+        await redis.set(keys.waitingUser(userId), JSON.stringify(user), { EX: WAITING_USER_TTL });
+        await redis.sadd(keys.waitingList(), userId);
         
-        const pipeline = redis.multi();
-        
-        // Add user data
-        pipeline.setEx(keys.waitingUser(userId), WAITING_USER_TTL, JSON.stringify(user));
-        
-        // Add to waiting list
-        pipeline.sAdd(keys.waitingList(), userId);
-        
-        // Update indexes
         if (typeof chatZone === 'number') {
-            pipeline.sAdd(keys.timezoneIndex(chatZone), userId);
-            pipeline.expire(keys.timezoneIndex(chatZone), INDEX_TTL);
+            await redis.sadd(keys.timezoneIndex(chatZone), userId);
+            await redis.expire(keys.timezoneIndex(chatZone), INDEX_TTL);
         }
         
         const gender = userInfo?.gender || 'Unspecified';
-        pipeline.sAdd(keys.genderIndex(gender), userId);
-        pipeline.expire(keys.genderIndex(gender), INDEX_TTL);
+        await redis.sadd(keys.genderIndex(gender), userId);
+        await redis.expire(keys.genderIndex(gender), INDEX_TTL);
         
-        // Add to fresh users if recent
-        pipeline.sAdd(keys.freshUsers(), userId);
-        pipeline.expire(keys.freshUsers(), 30); // 30 seconds
+        await redis.sadd(keys.freshUsers(), userId);
+        await redis.expire(keys.freshUsers(), 30);
         
-        // Update counters
-        pipeline.incr(keys.userCount());
-        pipeline.expire(keys.userCount(), WAITING_USER_TTL);
+        await redis.incr(keys.userCount());
+        await redis.expire(keys.userCount(), WAITING_USER_TTL);
         
-        await pipeline.exec();
-        return user;
+        return true;
     });
+    
+    if (!redisSuccess) {
+        memoryWaitingUsers.set(userId, user);
+        criticalLog('FALLBACK', 'Using memory storage for waiting user');
+    }
+    
+    return user;
 }
 
 async function removeWaitingUser(userId) {
-    return await safeRedisOp(async (redis) => {
-        const userKey = keys.waitingUser(userId);
-        const userData = await redis.get(userKey);
-        
+    // Try Redis first
+    const redisSuccess = await safeRedisOp(async (redis) => {
+        const userData = await redis.get(keys.waitingUser(userId));
         if (!userData) return false;
         
         const user = JSON.parse(userData);
-        const pipeline = redis.multi();
         
-        // Remove user data
-        pipeline.del(userKey);
+        await redis.del(keys.waitingUser(userId));
+        await redis.srem(keys.waitingList(), userId);
         
-        // Remove from waiting list
-        pipeline.sRem(keys.waitingList(), userId);
-        
-        // Remove from indexes
         if (typeof user.chatZone === 'number') {
-            pipeline.sRem(keys.timezoneIndex(user.chatZone), userId);
+            await redis.srem(keys.timezoneIndex(user.chatZone), userId);
         }
         
         const gender = user.userInfo?.gender || 'Unspecified';
-        pipeline.sRem(keys.genderIndex(gender), userId);
-        pipeline.sRem(keys.freshUsers(), userId);
+        await redis.srem(keys.genderIndex(gender), userId);
+        await redis.srem(keys.freshUsers(), userId);
+        await redis.decr(keys.userCount());
         
-        // Decrement counter
-        pipeline.decr(keys.userCount());
-        
-        await pipeline.exec();
         return true;
     });
+    
+    if (!redisSuccess) {
+        return memoryWaitingUsers.delete(userId);
+    }
+    
+    return redisSuccess;
 }
 
 async function getWaitingUser(userId) {
-    return await safeRedisOp(async (redis) => {
+    // Try Redis first
+    const redisUser = await safeRedisOp(async (redis) => {
         const userData = await redis.get(keys.waitingUser(userId));
         return userData ? JSON.parse(userData) : null;
     });
+    
+    if (redisUser) return redisUser;
+    
+    // Fallback to memory
+    return memoryWaitingUsers.get(userId) || null;
 }
 
 async function getAllWaitingUsers() {
-    return await safeRedisOp(async (redis) => {
-        const userIds = await redis.sMembers(keys.waitingList());
+    // Try Redis first
+    const redisUsers = await safeRedisOp(async (redis) => {
+        const userIds = await redis.smembers(keys.waitingList());
         if (!userIds.length) return new Map();
         
-        const pipeline = redis.multi();
-        userIds.forEach(userId => {
-            pipeline.get(keys.waitingUser(userId));
-        });
-        
-        const results = await pipeline.exec();
         const waitingUsers = new Map();
         
-        userIds.forEach((userId, index) => {
-            const userData = results[index][1];
+        // Get users one by one (no pipeline in simple implementation)
+        for (const userId of userIds) {
+            const userData = await redis.get(keys.waitingUser(userId));
             if (userData) {
                 waitingUsers.set(userId, JSON.parse(userData));
             }
-        });
+        }
         
         return waitingUsers;
     });
+    
+    if (redisUsers && redisUsers.size > 0) return redisUsers;
+    
+    // Fallback to memory
+    return memoryWaitingUsers;
 }
 
 async function getWaitingUserCount() {
-    return await safeRedisOp(async (redis) => {
+    const redisCount = await safeRedisOp(async (redis) => {
         const count = await redis.get(keys.userCount());
         return count ? parseInt(count) : 0;
     });
+    
+    if (redisCount !== null) return redisCount;
+    
+    return memoryWaitingUsers.size;
 }
 
 // ==========================================
-// REDIS ACTIVE MATCHES OPERATIONS
-// ==========================================
-
-async function createActiveMatch(matchId, p1, p2, userInfo, chatZones, matchScore) {
-    return await safeRedisOp(async (redis) => {
-        const match = {
-            p1, p2,
-            timestamp: Date.now(),
-            userInfo,
-            chatZones,
-            matchScore
-        };
-        
-        const pipeline = redis.multi();
-        
-        // Store match data
-        pipeline.setEx(keys.activeMatch(matchId), ACTIVE_MATCH_TTL, JSON.stringify(match));
-        
-        // Add to match list
-        pipeline.sAdd(keys.matchList(), matchId);
-        
-        // Initialize signal queues
-        pipeline.del(keys.signals(matchId, p1));
-        pipeline.del(keys.signals(matchId, p2));
-        
-        // Update counter
-        pipeline.incr(keys.matchCount());
-        pipeline.expire(keys.matchCount(), ACTIVE_MATCH_TTL);
-        
-        await pipeline.exec();
-        return match;
-    });
-}
-
-async function removeActiveMatch(matchId) {
-    return await safeRedisOp(async (redis) => {
-        const matchData = await redis.get(keys.activeMatch(matchId));
-        if (!matchData) return false;
-        
-        const match = JSON.parse(matchData);
-        const pipeline = redis.multi();
-        
-        // Remove match data
-        pipeline.del(keys.activeMatch(matchId));
-        
-        // Remove from match list
-        pipeline.sRem(keys.matchList(), matchId);
-        
-        // Clean up signal queues
-        pipeline.del(keys.signals(matchId, match.p1));
-        pipeline.del(keys.signals(matchId, match.p2));
-        
-        // Decrement counter
-        pipeline.decr(keys.matchCount());
-        
-        await pipeline.exec();
-        return true;
-    });
-}
-
-async function getActiveMatch(matchId) {
-    return await safeRedisOp(async (redis) => {
-        const matchData = await redis.get(keys.activeMatch(matchId));
-        return matchData ? JSON.parse(matchData) : null;
-    });
-}
-
-async function findUserMatch(userId) {
-    return await safeRedisOp(async (redis) => {
-        const matchIds = await redis.sMembers(keys.matchList());
-        
-        for (const matchId of matchIds) {
-            const matchData = await redis.get(keys.activeMatch(matchId));
-            if (matchData) {
-                const match = JSON.parse(matchData);
-                if (match.p1 === userId || match.p2 === userId) {
-                    return { matchId, match };
-                }
-            }
-        }
-        return null;
-    });
-}
-
-// ==========================================
-// REDIS SIGNALS OPERATIONS
-// ==========================================
-
-async function addSignal(matchId, toUserId, signal) {
-    return await safeRedisOp(async (redis) => {
-        const signalKey = keys.signals(matchId, toUserId);
-        
-        await redis.lPush(signalKey, JSON.stringify(signal));
-        await redis.expire(signalKey, SIGNAL_TTL);
-        
-        // Limit queue size
-        const queueLength = await redis.lLen(signalKey);
-        if (queueLength > 100) {
-            await redis.lTrim(signalKey, 0, 49); // Keep last 50
-        }
-        
-        return queueLength;
-    });
-}
-
-async function getSignals(matchId, userId) {
-    return await safeRedisOp(async (redis) => {
-        const signalKey = keys.signals(matchId, userId);
-        
-        // Get all signals and clear the queue
-        const signals = await redis.lRange(signalKey, 0, -1);
-        await redis.del(signalKey);
-        
-        return signals.map(signal => JSON.parse(signal)).reverse(); // FIFO order
-    });
-}
-
-// ==========================================
-// REDIS INDEX OPERATIONS
-// ==========================================
-
-async function getCandidatesByTimezone(chatZone) {
-    return await safeRedisOp(async (redis) => {
-        if (typeof chatZone !== 'number') return [];
-        return await redis.sMembers(keys.timezoneIndex(chatZone));
-    });
-}
-
-async function getCandidatesByGender(gender) {
-    return await safeRedisOp(async (redis) => {
-        return await redis.sMembers(keys.genderIndex(gender || 'Unspecified'));
-    });
-}
-
-async function getFreshUsers() {
-    return await safeRedisOp(async (redis) => {
-        return await redis.sMembers(keys.freshUsers());
-    });
-}
-
-// ==========================================
-// MATCHING STRATEGIES (Redis-adapted)
+// SIMPLE MATCHING STRATEGY
 // ==========================================
 
 async function findSimpleMatch(userId, userChatZone, userGender) {
@@ -458,17 +427,14 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
         
         let score = 1;
         
-        // Quick timezone score
         if (typeof userChatZone === 'number' && typeof candidate.chatZone === 'number') {
             const distance = getCircularDistance(userChatZone, candidate.chatZone);
             score += timezoneScoreTable[distance] || 0;
         }
         
-        // Quick gender score
         const candidateGender = candidate.userInfo?.gender || 'Unspecified';
         score += getGenderScore(userGender, candidateGender);
         
-        // Fresh bonus
         if (Date.now() - candidate.timestamp < 30000) {
             score += 2;
         }
@@ -478,143 +444,19 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
             bestMatch = { userId: candidateId, user: candidate, score };
         }
         
-        // Early exit for perfect matches
         if (score >= 25) break;
     }
     
     return bestMatch;
 }
 
-async function findUltraFastMatch(userId, userChatZone, userGender) {
-    const now = Date.now();
-    let bestMatch = null;
-    let bestScore = 0;
-    
-    // Get fresh users list
-    const freshUsers = new Set(await getFreshUsers());
-    
-    // 🔥 PRIORITY 1: Same timezone + fresh users (< 30s)
-    if (typeof userChatZone === 'number') {
-        const sameZoneCandidates = await getCandidatesByTimezone(userChatZone);
-        
-        for (const candidateId of sameZoneCandidates) {
-            if (candidateId === userId) continue;
-            
-            const candidate = await getWaitingUser(candidateId);
-            if (!candidate) continue;
-            
-            let score = 21; // Base score for same timezone (20 + 1)
-            
-            // Gender bonus
-            const candidateGender = candidate.userInfo?.gender || 'Unspecified';
-            score += getGenderScore(userGender, candidateGender);
-            
-            // Fresh user mega bonus
-            if (freshUsers.has(candidateId)) {
-                score += 3;
-            }
-            
-            // 🚀 EARLY EXIT: Perfect fresh match
-            if (score >= 27) {
-                return { userId: candidateId, user: candidate, score };
-            }
-            
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = { userId: candidateId, user: candidate, score };
-            }
-        }
-    }
-    
-    // 🔥 PRIORITY 2: Adjacent timezones (±1, ±2) - but only if no good same-zone match
-    if (bestScore < 23 && typeof userChatZone === 'number') {
-        const adjacentZones = [
-            userChatZone - 1, userChatZone + 1,  // ±1 hour
-            userChatZone - 2, userChatZone + 2   // ±2 hours
-        ];
-        
-        for (const adjZone of adjacentZones) {
-            const normalizedZone = ((adjZone + 12) % 24) - 12; // Handle wraparound
-            const adjCandidates = await getCandidatesByTimezone(normalizedZone);
-            
-            if (!adjCandidates.length) continue;
-            
-            // Only check first 2 candidates from adjacent zones for speed
-            const limitedCandidates = adjCandidates.slice(0, 2);
-            
-            for (const candidateId of limitedCandidates) {
-                if (candidateId === userId) continue;
-                
-                const candidate = await getWaitingUser(candidateId);
-                if (!candidate) continue;
-                
-                let score = 1 + getTimezoneScore(userChatZone, normalizedZone);
-                
-                // Gender bonus
-                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
-                score += getGenderScore(userGender, candidateGender);
-                
-                // Fresh bonus
-                if (freshUsers.has(candidateId)) {
-                    score += 2;
-                }
-                
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMatch = { userId: candidateId, user: candidate, score };
-                }
-            }
-        }
-    }
-    
-    // 🔥 PRIORITY 3: Any timezone - only if no decent match found
-    if (bestScore < 15) {
-        const waitingUsers = await getAllWaitingUsers();
-        let checkedCount = 0;
-        
-        for (const [candidateId, candidate] of waitingUsers.entries()) {
-            if (candidateId === userId || checkedCount >= 5) break;
-            checkedCount++;
-            
-            let score = 1 + getTimezoneScore(userChatZone, candidate.chatZone);
-            
-            const candidateGender = candidate.userInfo?.gender || 'Unspecified';
-            score += getGenderScore(userGender, candidateGender);
-            
-            if (freshUsers.has(candidateId)) {
-                score += 1;
-            }
-            
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = { userId: candidateId, user: candidate, score };
-            }
-        }
-    }
-    
-    return bestMatch;
-}
-
-async function findHybridMatch(userId, userChatZone, userGender) {
-    const userCount = await getWaitingUserCount();
-    
-    // If small user count, use simple approach
-    if (userCount <= 20) {
-        return await findSimpleMatch(userId, userChatZone, userGender);
-    }
-    
-    // Otherwise use optimized approach
-    return await findUltraFastMatch(userId, userChatZone, userGender);
-}
-
 // ==========================================
-// ADAPTIVE INSTANT MATCH HANDLER
+// MAIN HANDLERS
 // ==========================================
 
 async function handleInstantMatch(userId, data) {
     const { userInfo, preferredMatchId, chatZone, gender } = data;
     
-    // MINIMAL VALIDATION
     if (!userId || typeof userId !== 'string') {
         return createCorsResponse({ error: 'userId is required and must be string' }, 400);
     }
@@ -624,30 +466,9 @@ async function handleInstantMatch(userId, data) {
     // Remove from existing states
     await removeWaitingUser(userId);
     
-    // Remove from active matches
-    const existingMatch = await findUserMatch(userId);
-    if (existingMatch) {
-        await removeActiveMatch(existingMatch.matchId);
-    }
-    
-    // 🔧 ADAPTIVE MATCHING STRATEGY
+    // Simple matching strategy
     const userGender = gender || userInfo?.gender || 'Unspecified';
-    const userCount = await getWaitingUserCount();
-    
-    let bestMatch;
-    
-    if (userCount <= SIMPLE_STRATEGY_THRESHOLD) {
-        // Very small pool - use simple linear search
-        bestMatch = await findSimpleMatch(userId, chatZone, userGender);
-        
-    } else if (userCount <= HYBRID_STRATEGY_THRESHOLD) {
-        // Medium pool - use hybrid approach
-        bestMatch = await findHybridMatch(userId, chatZone, userGender);
-        
-    } else {
-        // Large pool - use full optimization
-        bestMatch = await findUltraFastMatch(userId, chatZone, userGender);
-    }
+    const bestMatch = await findSimpleMatch(userId, chatZone, userGender);
     
     if (bestMatch) {
         const partnerId = bestMatch.userId;
@@ -663,17 +484,23 @@ async function handleInstantMatch(userId, data) {
         const p1 = isUserInitiator ? userId : partnerId;
         const p2 = isUserInitiator ? partnerId : userId;
         
-        const userInfoMap = {
-            [userId]: userInfo || {},
-            [partnerId]: partnerUser.userInfo || {}
+        // Store match in memory for simplicity
+        const match = {
+            p1, p2,
+            timestamp: Date.now(),
+            signals: { [p1]: [], [p2]: [] },
+            userInfo: {
+                [userId]: userInfo || {},
+                [partnerId]: partnerUser.userInfo || {}
+            },
+            chatZones: {
+                [userId]: chatZone,
+                [partnerId]: partnerUser.chatZone
+            },
+            matchScore: bestMatch.score
         };
         
-        const chatZonesMap = {
-            [userId]: chatZone,
-            [partnerId]: partnerUser.chatZone
-        };
-        
-        await createActiveMatch(matchId, p1, p2, userInfoMap, chatZonesMap, bestMatch.score);
+        memoryActiveMatches.set(matchId, match);
         
         criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
         
@@ -710,37 +537,35 @@ async function handleInstantMatch(userId, data) {
     }
 }
 
-// ==========================================
-// OTHER HANDLERS (Redis-adapted)
-// ==========================================
-
 async function handleGetSignals(userId, data) {
     const { chatZone, gender } = data;
     
-    const userMatch = await findUserMatch(userId);
-    if (userMatch) {
-        const { matchId, match } = userMatch;
-        const partnerId = match.p1 === userId ? match.p2 : match.p1;
-        const signals = await getSignals(matchId, userId);
-        
-        smartLog('GET-SIGNALS', `${userId.slice(-8)} -> ${signals.length} signals`);
-        
-        return createCorsResponse({
-            status: 'matched',
-            matchId,
-            partnerId,
-            isInitiator: match.p1 === userId,
-            signals,
-            partnerChatZone: match.chatZones ? match.chatZones[partnerId] : null,
-            matchScore: match.matchScore || null,
-            timestamp: Date.now()
-        });
+    // Check active matches
+    for (const [matchId, match] of memoryActiveMatches.entries()) {
+        if (match.p1 === userId || match.p2 === userId) {
+            const partnerId = match.p1 === userId ? match.p2 : match.p1;
+            const signals = match.signals[userId] || [];
+            
+            match.signals[userId] = [];
+            
+            smartLog('GET-SIGNALS', `${userId.slice(-8)} -> ${signals.length} signals`);
+            
+            return createCorsResponse({
+                status: 'matched',
+                matchId,
+                partnerId,
+                isInitiator: match.p1 === userId,
+                signals,
+                partnerChatZone: match.chatZones ? match.chatZones[partnerId] : null,
+                matchScore: match.matchScore || null,
+                timestamp: Date.now()
+            });
+        }
     }
     
     const waitingUser = await getWaitingUser(userId);
     if (waitingUser) {
         const totalUsers = await getWaitingUserCount();
-        // Calculate position (approximate)
         const position = Math.max(1, Math.floor(totalUsers * Math.random()) + 1);
         
         return createCorsResponse({
@@ -770,7 +595,7 @@ async function handleSendSignal(userId, data) {
         }, 400);
     }
     
-    const match = await getActiveMatch(matchId);
+    const match = memoryActiveMatches.get(matchId);
     if (!match) {
         return createCorsResponse({ 
             error: 'Match not found',
@@ -784,6 +609,10 @@ async function handleSendSignal(userId, data) {
     
     const partnerId = match.p1 === userId ? match.p2 : match.p1;
     
+    if (!match.signals[partnerId]) {
+        match.signals[partnerId] = [];
+    }
+    
     const signal = {
         type,
         payload,
@@ -791,7 +620,11 @@ async function handleSendSignal(userId, data) {
         timestamp: Date.now()
     };
     
-    const queueLength = await addSignal(matchId, partnerId, signal);
+    match.signals[partnerId].push(signal);
+    
+    if (match.signals[partnerId].length > 100) {
+        match.signals[partnerId] = match.signals[partnerId].slice(-50);
+    }
     
     smartLog('SEND-SIGNAL', `${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type})`);
     
@@ -799,7 +632,7 @@ async function handleSendSignal(userId, data) {
         status: 'sent',
         partnerId,
         signalType: type,
-        queueLength,
+        queueLength: match.signals[partnerId].length,
         timestamp: Date.now()
     });
 }
@@ -810,13 +643,11 @@ async function handleP2pConnected(userId, data) {
     
     let removed = false;
     
-    // Remove both users from waiting (if any)
     const userRemoved = await removeWaitingUser(userId);
     const partnerRemoved = await removeWaitingUser(partnerId);
     removed = userRemoved || partnerRemoved;
     
-    // Remove the match
-    await removeActiveMatch(matchId);
+    memoryActiveMatches.delete(matchId);
     
     return createCorsResponse({
         status: 'p2p_connected',
@@ -830,29 +661,27 @@ async function handleDisconnect(userId) {
     
     let removed = false;
     
-    // Remove from waiting list
     const userRemoved = await removeWaitingUser(userId);
     if (userRemoved) removed = true;
     
-    // Find and handle active match
-    const userMatch = await findUserMatch(userId);
-    if (userMatch) {
-        const { matchId, match } = userMatch;
-        const partnerId = match.p1 === userId ? match.p2 : match.p1;
-        
-        // Send disconnect signal to partner
-        const disconnectSignal = {
-            type: 'disconnect',
-            payload: { reason: 'partner_disconnected' },
-            from: userId,
-            timestamp: Date.now()
-        };
-        
-        await addSignal(matchId, partnerId, disconnectSignal);
-        
-        criticalLog('DISCONNECT', `Removing match ${matchId}`);
-        await removeActiveMatch(matchId);
-        removed = true;
+    for (const [matchId, match] of memoryActiveMatches.entries()) {
+        if (match.p1 === userId || match.p2 === userId) {
+            const partnerId = match.p1 === userId ? match.p2 : match.p1;
+            
+            if (match.signals && match.signals[partnerId]) {
+                match.signals[partnerId].push({
+                    type: 'disconnect',
+                    payload: { reason: 'partner_disconnected' },
+                    from: userId,
+                    timestamp: Date.now()
+                });
+            }
+            
+            criticalLog('DISCONNECT', `Removing match ${matchId}`);
+            memoryActiveMatches.delete(matchId);
+            removed = true;
+            break;
+        }
     }
     
     return createCorsResponse({ 
@@ -863,112 +692,10 @@ async function handleDisconnect(userId) {
 }
 
 // ==========================================
-// REDIS CLEANUP
-// ==========================================
-
-async function cleanup() {
-    await safeRedisOp(async (redis) => {
-        const now = Date.now();
-        let cleanedUsers = 0;
-        let cleanedMatches = 0;
-        
-        // Cleanup expired waiting users
-        const userIds = await redis.sMembers(keys.waitingList());
-        const expiredUsers = [];
-        
-        if (userIds.length > 0) {
-            const pipeline = redis.multi();
-            userIds.forEach(userId => {
-                pipeline.get(keys.waitingUser(userId));
-            });
-            
-            const results = await pipeline.exec();
-            
-            userIds.forEach((userId, index) => {
-                const userData = results[index][1];
-                                    if (userData) {
-                    const user = JSON.parse(userData);
-                    if (now - user.timestamp > USER_TIMEOUT) {
-                        expiredUsers.push(userId);
-                    }
-                } else {
-                    // User data missing, remove from list
-                    expiredUsers.push(userId);
-                }
-            });
-        }
-        
-        // Remove expired users
-        for (const userId of expiredUsers) {
-            await removeWaitingUser(userId);
-            cleanedUsers++;
-        }
-        
-        // Cleanup expired matches
-        const matchIds = await redis.sMembers(keys.matchList());
-        const expiredMatches = [];
-        
-        if (matchIds.length > 0) {
-            const pipeline = redis.multi();
-            matchIds.forEach(matchId => {
-                pipeline.get(keys.activeMatch(matchId));
-            });
-            
-            const results = await pipeline.exec();
-            
-            matchIds.forEach((matchId, index) => {
-                const matchData = results[index][1];
-                if (matchData) {
-                    const match = JSON.parse(matchData);
-                    if (now - match.timestamp > MATCH_LIFETIME) {
-                        expiredMatches.push(matchId);
-                    }
-                } else {
-                    // Match data missing, remove from list
-                    expiredMatches.push(matchId);
-                }
-            });
-        }
-        
-        // Remove expired matches
-        for (const matchId of expiredMatches) {
-            await removeActiveMatch(matchId);
-            cleanedMatches++;
-        }
-        
-        // Capacity limit cleanup for waiting users
-        const currentUserCount = await getWaitingUserCount();
-        if (currentUserCount > MAX_WAITING_USERS) {
-            const excess = currentUserCount - MAX_WAITING_USERS;
-            const allUsers = await getAllWaitingUsers();
-            
-            // Sort by timestamp and remove oldest
-            const sortedUsers = Array.from(allUsers.entries())
-                .sort((a, b) => a[1].timestamp - b[1].timestamp)
-                .slice(0, excess);
-            
-            for (const [userId] of sortedUsers) {
-                await removeWaitingUser(userId);
-                cleanedUsers++;
-            }
-        }
-        
-        if (cleanedUsers > 0 || cleanedMatches > 0) {
-            const remainingUsers = await getWaitingUserCount();
-            const remainingMatches = (await redis.sCard(keys.matchList())) || 0;
-            criticalLog('CLEANUP', `Removed ${cleanedUsers} users, ${cleanedMatches} matches. Active: ${remainingUsers} waiting, ${remainingMatches} matched`);
-        }
-    });
-}
-
-// ==========================================
 // MAIN HANDLER FUNCTION
 // ==========================================
 
 export default async function handler(req) {
-    // Run cleanup periodically
-    await cleanup();
-    
     if (req.method === 'OPTIONS') {
         return createCorsResponse(null, 200);
     }
@@ -979,22 +706,15 @@ export default async function handler(req) {
         
         if (debug === 'true') {
             const waitingCount = await getWaitingUserCount();
-            const matchCount = await safeRedisOp(async (redis) => {
-                return await redis.sCard(keys.matchList());
-            }) || 0;
             
             return createCorsResponse({
-                status: 'redis-optimized-webrtc-signaling',
+                status: 'edge-compatible-webrtc-signaling',
                 runtime: 'edge',
-                redis: 'enabled',
-                strategies: {
-                    simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
-                    hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
-                    optimized: `>${HYBRID_STRATEGY_THRESHOLD} users`
-                },
+                redis: process.env.REDIS_URL ? 'configured' : 'not-configured',
+                storage: 'hybrid-redis-memory',
                 stats: {
                     waitingUsers: waitingCount,
-                    activeMatches: matchCount,
+                    activeMatches: memoryActiveMatches.size,
                     cacheSize: distanceCache.size
                 },
                 timestamp: Date.now()
@@ -1002,23 +722,17 @@ export default async function handler(req) {
         }
         
         const waitingCount = await getWaitingUserCount();
-        const matchCount = await safeRedisOp(async (redis) => {
-            return await redis.sCard(keys.matchList());
-        }) || 0;
-        
-        const strategy = waitingCount <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
-                        waitingCount <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized';
         
         return createCorsResponse({ 
-            status: 'redis-optimized-signaling-ready',
+            status: 'edge-compatible-signaling-ready',
             runtime: 'edge',
-            redis: 'connected',
+            redis: process.env.REDIS_URL ? 'available' : 'fallback-memory',
             stats: { 
                 waiting: waitingCount, 
-                matches: matchCount,
-                strategy
+                matches: memoryActiveMatches.size,
+                strategy: 'simple'
             },
-            message: 'Redis-optimized WebRTC signaling server ready',
+            message: 'Edge-compatible WebRTC signaling server ready',
             timestamp: Date.now()
         });
     }
@@ -1028,45 +742,21 @@ export default async function handler(req) {
     }
     
     try {
-        // FLEXIBLE JSON PARSING
         let data;
-        let requestBody = '';
         
         try {
             data = await req.json();
         } catch (jsonError) {
-            if (!req.body) {
-                return createCorsResponse({ 
-                    error: 'No request body found',
-                    tip: 'Send JSON body with your POST request'
-                }, 400);
-            }
-            
-            const reader = req.body.getReader();
-            const decoder = new TextDecoder();
-            
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                requestBody += decoder.decode(value, { stream: true });
-            }
-            
-            if (!requestBody.trim()) {
-                return createCorsResponse({ 
-                    error: 'Empty request body',
-                    tip: 'Send JSON data'
-                }, 400);
-            }
-            
-            data = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
+            return createCorsResponse({ 
+                error: 'Invalid JSON in request body'
+            }, 400);
         }
         
         const { action, userId, chatZone } = data;
         
         if (!userId) {
             return createCorsResponse({ 
-                error: 'userId is required',
-                tip: 'Include userId in your JSON'
+                error: 'userId is required'
             }, 400);
         }
         
@@ -1103,3 +793,4 @@ export default async function handler(req) {
     }
 }
 
+ 
