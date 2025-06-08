@@ -1,9 +1,11 @@
-// 🚀 EDGE-COMPATIBLE Redis WebRTC Signaling Server
+// 🚀 VERCEL KV WebRTC Signaling Server (Based on Original)
+
+import { kv } from '@vercel/kv';
 
 const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
-// CONFIGURATION & CONSTANTS
+// CONFIGURATION & CONSTANTS (Original)
 // ==========================================
 
 const USER_TIMEOUT = 120000; // 2 minutes for waiting users
@@ -13,191 +15,144 @@ const MAX_WAITING_USERS = 120000; // Prevent memory bloat
 // Timezone scoring constants
 const TIMEZONE_MAX_SCORE = 20;
 const TIMEZONE_PENALTY = 1;
+const TIMEZONE_CIRCLE_HOURS = 24;
 
 // Performance constants
+const INDEX_REBUILD_INTERVAL = 10000; // 10 seconds
 const MAX_CACHE_SIZE = 1000;
-const MAX_CANDIDATES = 5;
+const MATCH_CACHE_TTL = 5000; // 5 seconds
+const MAX_CANDIDATES = 5; // Reduced from 10
 
 // Adaptive strategy thresholds
 const SIMPLE_STRATEGY_THRESHOLD = 10;
 const HYBRID_STRATEGY_THRESHOLD = 100;
 
-// Redis TTL settings
-const WAITING_USER_TTL = 180; // 3 minutes
-const ACTIVE_MATCH_TTL = 720; // 12 minutes
-const SIGNAL_TTL = 300; // 5 minutes
-const INDEX_TTL = 60; // 1 minute for indexes
-
 // ==========================================
-// EDGE-COMPATIBLE REDIS CLIENT
+// VERCEL KV STORAGE (Replacing in-memory)
 // ==========================================
 
-class EdgeRedisClient {
-    constructor(url) {
-        this.url = url;
-        this.parseRedisUrl();
-    }
-    
-    parseRedisUrl() {
-        try {
-            const parsed = new URL(this.url);
-            this.host = parsed.hostname;
-            this.port = parsed.port || 6379;
-            this.password = parsed.password;
-            this.baseUrl = `https://${this.host}:${this.port}`;
-        } catch (error) {
-            criticalLog('REDIS-ERROR', 'Invalid Redis URL:', error.message);
-            throw error;
-        }
-    }
-    
-    async executeCommand(command, ...args) {
-        try {
-            const body = [command, ...args].map(arg => 
-                typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
-            );
-            
-            const response = await fetch(`${this.baseUrl}`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${this.password}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(body)
-            });
-            
-            if (!response.ok) {
-                throw new Error(`Redis command failed: ${response.status}`);
-            }
-            
-            const result = await response.json();
-            return result.result;
-        } catch (error) {
-            criticalLog('REDIS-CMD-ERROR', command, error.message);
-            return null;
-        }
-    }
-    
-    // Basic Redis commands for Edge Runtime
-    async get(key) {
-        return await this.executeCommand('GET', key);
-    }
-    
-    async set(key, value, options = {}) {
-        if (options.EX) {
-            return await this.executeCommand('SETEX', key, options.EX, value);
-        }
-        return await this.executeCommand('SET', key, value);
-    }
-    
-    async del(key) {
-        return await this.executeCommand('DEL', key);
-    }
-    
-    async sadd(key, ...members) {
-        return await this.executeCommand('SADD', key, ...members);
-    }
-    
-    async srem(key, ...members) {
-        return await this.executeCommand('SREM', key, ...members);
-    }
-    
-    async smembers(key) {
-        return await this.executeCommand('SMEMBERS', key) || [];
-    }
-    
-    async scard(key) {
-        return await this.executeCommand('SCARD', key) || 0;
-    }
-    
-    async lpush(key, ...values) {
-        return await this.executeCommand('LPUSH', key, ...values);
-    }
-    
-    async lrange(key, start, stop) {
-        return await this.executeCommand('LRANGE', key, start, stop) || [];
-    }
-    
-    async llen(key) {
-        return await this.executeCommand('LLEN', key) || 0;
-    }
-    
-    async ltrim(key, start, stop) {
-        return await this.executeCommand('LTRIM', key, start, stop);
-    }
-    
-    async incr(key) {
-        return await this.executeCommand('INCR', key);
-    }
-    
-    async decr(key) {
-        return await this.executeCommand('DECR', key);
-    }
-    
-    async expire(key, seconds) {
-        return await this.executeCommand('EXPIRE', key, seconds);
-    }
-}
-
-let redisClient = null;
-
-function getRedisClient() {
-    if (!redisClient && process.env.REDIS_URL) {
-        redisClient = new EdgeRedisClient(process.env.REDIS_URL);
-    }
-    return redisClient;
-}
-
-// ==========================================
-// REDIS UTILITIES
-// ==========================================
-
-async function safeRedisOp(operation) {
-    try {
-        const redis = getRedisClient();
-        if (!redis) {
-            criticalLog('REDIS-ERROR', 'Redis client not available');
-            return null;
-        }
-        return await operation(redis);
-    } catch (error) {
-        criticalLog('REDIS-ERROR', error.message);
-        return null;
-    }
-}
-
-// Redis key generators
-const keys = {
-    waitingUser: (userId) => `waiting:${userId}`,
-    waitingList: () => 'waiting:list',
-    activeMatch: (matchId) => `match:${matchId}`,
-    matchList: () => 'match:list',
-    signals: (matchId, userId) => `signals:${matchId}:${userId}`,
+// KV Keys
+const kvKeys = {
+    waitingUsers: 'waiting_users',
+    activeMatches: 'active_matches',
     timezoneIndex: (zone) => `tz_idx:${zone}`,
     genderIndex: (gender) => `gender_idx:${gender}`,
-    freshUsers: () => 'fresh_users',
-    userCount: () => 'user_count',
-    matchCount: () => 'match_count'
+    freshUsers: 'fresh_users',
+    lastIndexRebuild: 'last_index_rebuild'
 };
 
+// KV Utilities
+async function getWaitingUsers() {
+    try {
+        const data = await kv.get(kvKeys.waitingUsers);
+        return data ? new Map(Object.entries(data)) : new Map();
+    } catch (error) {
+        criticalLog('KV-ERROR', 'Failed to get waiting users:', error.message);
+        return new Map();
+    }
+}
+
+async function setWaitingUsers(waitingUsers) {
+    try {
+        const data = Object.fromEntries(waitingUsers);
+        await kv.set(kvKeys.waitingUsers, data, { ex: 300 }); // 5 min TTL
+        return true;
+    } catch (error) {
+        criticalLog('KV-ERROR', 'Failed to set waiting users:', error.message);
+        return false;
+    }
+}
+
+async function getActiveMatches() {
+    try {
+        const data = await kv.get(kvKeys.activeMatches);
+        return data ? new Map(Object.entries(data)) : new Map();
+    } catch (error) {
+        criticalLog('KV-ERROR', 'Failed to get active matches:', error.message);
+        return new Map();
+    }
+}
+
+async function setActiveMatches(activeMatches) {
+    try {
+        const data = Object.fromEntries(activeMatches);
+        await kv.set(kvKeys.activeMatches, data, { ex: 600 }); // 10 min TTL
+        return true;
+    } catch (error) {
+        criticalLog('KV-ERROR', 'Failed to set active matches:', error.message);
+        return false;
+    }
+}
+
+async function getTimezoneIndex(zone) {
+    try {
+        const data = await kv.get(kvKeys.timezoneIndex(zone));
+        return data ? new Set(data) : new Set();
+    } catch (error) {
+        return new Set();
+    }
+}
+
+async function setTimezoneIndex(zone, userSet) {
+    try {
+        await kv.set(kvKeys.timezoneIndex(zone), Array.from(userSet), { ex: 120 });
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+async function getGenderIndex(gender) {
+    try {
+        const data = await kv.get(kvKeys.genderIndex(gender));
+        return data ? new Set(data) : new Set();
+    } catch (error) {
+        return new Set();
+    }
+}
+
+async function setGenderIndex(gender, userSet) {
+    try {
+        await kv.set(kvKeys.genderIndex(gender), Array.from(userSet), { ex: 120 });
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+async function getFreshUsers() {
+    try {
+        const data = await kv.get(kvKeys.freshUsers);
+        return data ? new Set(data) : new Set();
+    } catch (error) {
+        return new Set();
+    }
+}
+
+async function setFreshUsers(userSet) {
+    try {
+        await kv.set(kvKeys.freshUsers, Array.from(userSet), { ex: 60 });
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
 // ==========================================
-// IN-MEMORY FALLBACK
+// OPTIMIZED GLOBAL STATE (Original logic)
 // ==========================================
 
-// Fallback to in-memory if Redis fails
-let memoryWaitingUsers = new Map();
-let memoryActiveMatches = new Map();
+// 🔥 OPTIMIZATION: Pre-calculated distance cache (kept in memory for speed)
+let distanceCache = new Map(); // "zone1,zone2" -> circularDistance
+let timezoneScoreTable = new Array(25); // Pre-calculated scores 0-24
+let genderScoreTable = new Map(); // Pre-calculated gender combinations
+
+// 🔥 OPTIMIZATION: Object pools for memory optimization
+let matchObjectPool = [];
+let signalObjectPool = [];
 
 // ==========================================
-// OPTIMIZED GLOBAL STATE
-// ==========================================
-
-let distanceCache = new Map();
-let timezoneScoreTable = new Array(25);
-let genderScoreTable = new Map();
-
-// ==========================================
-// LOGGING UTILITIES
+// LOGGING UTILITIES (Original)
 // ==========================================
 
 function smartLog(level, ...args) {
@@ -211,7 +166,7 @@ function criticalLog(level, ...args) {
 }
 
 // ==========================================
-// CORS & RESPONSE UTILITIES
+// CORS & RESPONSE UTILITIES (Original)
 // ==========================================
 
 function createCorsResponse(data, status = 200) {
@@ -221,14 +176,13 @@ function createCorsResponse(data, status = 200) {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-            'Access-Control-Max-Age': '86400'
+            'Access-Control-Allow-Headers': 'Content-Type'
         }
     });
 }
 
 // ==========================================
-// INITIALIZATION
+// INITIALIZATION - PRE-CALCULATE TABLES (Original)
 // ==========================================
 
 function initializeOptimizations() {
@@ -257,12 +211,13 @@ function initializeOptimizations() {
 initializeOptimizations();
 
 // ==========================================
-// DISTANCE CALCULATION
+// ULTRA-FAST DISTANCE CALCULATION WITH CACHE (Original)
 // ==========================================
 
 function getCircularDistance(zone1, zone2) {
     if (typeof zone1 !== 'number' || typeof zone2 !== 'number') return 12;
     
+    // Cache key (normalized)
     const cacheKey = zone1 <= zone2 ? `${zone1},${zone2}` : `${zone2},${zone1}`;
     
     if (distanceCache.has(cacheKey)) {
@@ -272,6 +227,7 @@ function getCircularDistance(zone1, zone2) {
     const linear = Math.abs(zone1 - zone2);
     const circular = linear > 12 ? 24 - linear : linear;
     
+    // Add to cache with LRU eviction
     if (distanceCache.size >= MAX_CACHE_SIZE) {
         const firstKey = distanceCache.keys().next().value;
         distanceCache.delete(firstKey);
@@ -292,133 +248,81 @@ function getGenderScore(gender1, gender2) {
 }
 
 // ==========================================
-// HYBRID STORAGE OPERATIONS
+// ADAPTIVE INDEX MANAGEMENT (Modified for KV)
 // ==========================================
 
-async function addWaitingUser(userId, userInfo, chatZone) {
-    const user = {
-        userId,
-        userInfo: userInfo || {},
-        chatZone: chatZone || null,
-        timestamp: Date.now()
-    };
+async function buildIndexesIfNeeded() {
+    const now = Date.now();
     
-    // Try Redis first, fallback to memory
-    const redisSuccess = await safeRedisOp(async (redis) => {
-        await redis.set(keys.waitingUser(userId), JSON.stringify(user), { EX: WAITING_USER_TTL });
-        await redis.sadd(keys.waitingList(), userId);
-        
-        if (typeof chatZone === 'number') {
-            await redis.sadd(keys.timezoneIndex(chatZone), userId);
-            await redis.expire(keys.timezoneIndex(chatZone), INDEX_TTL);
-        }
-        
-        const gender = userInfo?.gender || 'Unspecified';
-        await redis.sadd(keys.genderIndex(gender), userId);
-        await redis.expire(keys.genderIndex(gender), INDEX_TTL);
-        
-        await redis.sadd(keys.freshUsers(), userId);
-        await redis.expire(keys.freshUsers(), 30);
-        
-        await redis.incr(keys.userCount());
-        await redis.expire(keys.userCount(), WAITING_USER_TTL);
-        
-        return true;
-    });
-    
-    if (!redisSuccess) {
-        memoryWaitingUsers.set(userId, user);
-        criticalLog('FALLBACK', 'Using memory storage for waiting user');
+    // Check if rebuild needed
+    const lastRebuild = await kv.get(kvKeys.lastIndexRebuild) || 0;
+    if (now - lastRebuild < INDEX_REBUILD_INTERVAL) {
+        return; // Skip rebuild
     }
     
-    return user;
-}
-
-async function removeWaitingUser(userId) {
-    // Try Redis first
-    const redisSuccess = await safeRedisOp(async (redis) => {
-        const userData = await redis.get(keys.waitingUser(userId));
-        if (!userData) return false;
-        
-        const user = JSON.parse(userData);
-        
-        await redis.del(keys.waitingUser(userId));
-        await redis.srem(keys.waitingList(), userId);
-        
-        if (typeof user.chatZone === 'number') {
-            await redis.srem(keys.timezoneIndex(user.chatZone), userId);
-        }
-        
-        const gender = user.userInfo?.gender || 'Unspecified';
-        await redis.srem(keys.genderIndex(gender), userId);
-        await redis.srem(keys.freshUsers(), userId);
-        await redis.decr(keys.userCount());
-        
-        return true;
-    });
+    const waitingUsers = await getWaitingUsers();
     
-    if (!redisSuccess) {
-        return memoryWaitingUsers.delete(userId);
+    // Quick rebuild only if small user count
+    if (waitingUsers.size < 50) {
+        await buildIndexes();
+        return;
     }
-    
-    return redisSuccess;
 }
 
-async function getWaitingUser(userId) {
-    // Try Redis first
-    const redisUser = await safeRedisOp(async (redis) => {
-        const userData = await redis.get(keys.waitingUser(userId));
-        return userData ? JSON.parse(userData) : null;
-    });
+async function buildIndexes() {
+    const now = Date.now();
+    const waitingUsers = await getWaitingUsers();
     
-    if (redisUser) return redisUser;
+    // Clear and rebuild indexes
+    let timezoneIndexes = new Map();
+    let genderIndexes = new Map();
+    let freshUsersSet = new Set();
     
-    // Fallback to memory
-    return memoryWaitingUsers.get(userId) || null;
-}
-
-async function getAllWaitingUsers() {
-    // Try Redis first
-    const redisUsers = await safeRedisOp(async (redis) => {
-        const userIds = await redis.smembers(keys.waitingList());
-        if (!userIds.length) return new Map();
-        
-        const waitingUsers = new Map();
-        
-        // Get users one by one (no pipeline in simple implementation)
-        for (const userId of userIds) {
-            const userData = await redis.get(keys.waitingUser(userId));
-            if (userData) {
-                waitingUsers.set(userId, JSON.parse(userData));
+    // Build new indexes in single pass
+    for (const [userId, user] of waitingUsers.entries()) {
+        // Timezone index
+        const zone = user.chatZone;
+        if (typeof zone === 'number') {
+            if (!timezoneIndexes.has(zone)) {
+                timezoneIndexes.set(zone, new Set());
             }
+            timezoneIndexes.get(zone).add(userId);
         }
         
-        return waitingUsers;
-    });
+        // Gender index
+        const gender = user.userInfo?.gender || 'Unspecified';
+        if (!genderIndexes.has(gender)) {
+            genderIndexes.set(gender, new Set());
+        }
+        genderIndexes.get(gender).add(userId);
+        
+        // Fresh users (< 30 seconds)
+        if (now - user.timestamp < 30000) {
+            freshUsersSet.add(userId);
+        }
+    }
     
-    if (redisUsers && redisUsers.size > 0) return redisUsers;
+    // Save indexes to KV
+    for (const [zone, userSet] of timezoneIndexes.entries()) {
+        await setTimezoneIndex(zone, userSet);
+    }
     
-    // Fallback to memory
-    return memoryWaitingUsers;
-}
-
-async function getWaitingUserCount() {
-    const redisCount = await safeRedisOp(async (redis) => {
-        const count = await redis.get(keys.userCount());
-        return count ? parseInt(count) : 0;
-    });
+    for (const [gender, userSet] of genderIndexes.entries()) {
+        await setGenderIndex(gender, userSet);
+    }
     
-    if (redisCount !== null) return redisCount;
+    await setFreshUsers(freshUsersSet);
+    await kv.set(kvKeys.lastIndexRebuild, now, { ex: 600 });
     
-    return memoryWaitingUsers.size;
+    smartLog('INDEX-REBUILD', `Indexes built: ${timezoneIndexes.size} zones, ${genderIndexes.size} genders, ${freshUsersSet.size} fresh`);
 }
 
 // ==========================================
-// SIMPLE MATCHING STRATEGY
+// MATCHING STRATEGIES (Original logic, KV data)
 // ==========================================
 
 async function findSimpleMatch(userId, userChatZone, userGender) {
-    const waitingUsers = await getAllWaitingUsers();
+    const waitingUsers = await getWaitingUsers();
     
     let bestMatch = null;
     let bestScore = 0;
@@ -428,14 +332,17 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
         
         let score = 1;
         
+        // Quick timezone score
         if (typeof userChatZone === 'number' && typeof candidate.chatZone === 'number') {
             const distance = getCircularDistance(userChatZone, candidate.chatZone);
             score += timezoneScoreTable[distance] || 0;
         }
         
+        // Quick gender score
         const candidateGender = candidate.userInfo?.gender || 'Unspecified';
         score += getGenderScore(userGender, candidateGender);
         
+        // Fresh bonus
         if (Date.now() - candidate.timestamp < 30000) {
             score += 2;
         }
@@ -445,19 +352,85 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
             bestMatch = { userId: candidateId, user: candidate, score };
         }
         
+        // Early exit for perfect matches
         if (score >= 25) break;
     }
     
     return bestMatch;
 }
 
+async function findUltraFastMatch(userId, userChatZone, userGender) {
+    await buildIndexesIfNeeded();
+    
+    const now = Date.now();
+    let bestMatch = null;
+    let bestScore = 0;
+    
+    // Get fresh users list
+    const freshUsers = await getFreshUsers();
+    
+    // 🔥 PRIORITY 1: Same timezone + fresh users (< 30s)
+    if (typeof userChatZone === 'number') {
+        const sameZoneCandidates = await getTimezoneIndex(userChatZone);
+        const waitingUsers = await getWaitingUsers();
+        
+        for (const candidateId of sameZoneCandidates) {
+            if (candidateId === userId) continue;
+            
+            const candidate = waitingUsers.get(candidateId);
+            if (!candidate) continue;
+            
+            let score = 21; // Base score for same timezone (20 + 1)
+            
+            // Gender bonus
+            const candidateGender = candidate.userInfo?.gender || 'Unspecified';
+            score += getGenderScore(userGender, candidateGender);
+            
+            // Fresh user mega bonus
+            if (freshUsers.has(candidateId)) {
+                score += 3;
+            }
+            
+            // 🚀 EARLY EXIT: Perfect fresh match
+            if (score >= 27) {
+                return { userId: candidateId, user: candidate, score };
+            }
+            
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = { userId: candidateId, user: candidate, score };
+            }
+        }
+    }
+    
+    // If no good match found, fallback to simple search
+    if (bestScore < 20) {
+        return await findSimpleMatch(userId, userChatZone, userGender);
+    }
+    
+    return bestMatch;
+}
+
+async function findHybridMatch(userId, userChatZone, userGender) {
+    const waitingUsers = await getWaitingUsers();
+    
+    // If small user count, use simple approach (like old version)
+    if (waitingUsers.size <= 20) {
+        return await findSimpleMatch(userId, userChatZone, userGender);
+    }
+    
+    // Otherwise use optimized approach
+    return await findUltraFastMatch(userId, userChatZone, userGender);
+}
+
 // ==========================================
-// MAIN HANDLERS
+// ADAPTIVE INSTANT MATCH HANDLER (Modified for KV)
 // ==========================================
 
 async function handleInstantMatch(userId, data) {
     const { userInfo, preferredMatchId, chatZone, gender } = data;
     
+    // MINIMAL VALIDATION - NO chatZone validation to avoid 400 error
     if (!userId || typeof userId !== 'string') {
         return createCorsResponse({ error: 'userId is required and must be string' }, 400);
     }
@@ -465,18 +438,48 @@ async function handleInstantMatch(userId, data) {
     smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
     
     // Remove from existing states
-    await removeWaitingUser(userId);
+    const waitingUsers = await getWaitingUsers();
+    const activeMatches = await getActiveMatches();
     
-    // Simple matching strategy
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        await setWaitingUsers(waitingUsers);
+    }
+    
+    // Remove from active matches
+    for (const [matchId, match] of activeMatches.entries()) {
+        if (match.p1 === userId || match.p2 === userId) {
+            activeMatches.delete(matchId);
+            await setActiveMatches(activeMatches);
+            break;
+        }
+    }
+    
+    // 🔧 ADAPTIVE MATCHING STRATEGY
     const userGender = gender || userInfo?.gender || 'Unspecified';
-    const bestMatch = await findSimpleMatch(userId, chatZone, userGender);
+    
+    let bestMatch;
+    
+    if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
+        // Very small pool - use simple linear search (fastest for small data)
+        bestMatch = await findSimpleMatch(userId, chatZone, userGender);
+        
+    } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
+        // Medium pool - use hybrid approach
+        bestMatch = await findHybridMatch(userId, chatZone, userGender);
+        
+    } else {
+        // Large pool - use full optimization
+        bestMatch = await findUltraFastMatch(userId, chatZone, userGender);
+    }
     
     if (bestMatch) {
         const partnerId = bestMatch.userId;
         const partnerUser = bestMatch.user;
         
         // Remove partner from waiting
-        await removeWaitingUser(partnerId);
+        waitingUsers.delete(partnerId);
+        await setWaitingUsers(waitingUsers);
         
         // Create match
         const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -485,7 +488,7 @@ async function handleInstantMatch(userId, data) {
         const p1 = isUserInitiator ? userId : partnerId;
         const p2 = isUserInitiator ? partnerId : userId;
         
-        // Store match in memory for simplicity
+        // Use simple object creation for reliability
         const match = {
             p1, p2,
             timestamp: Date.now(),
@@ -501,7 +504,8 @@ async function handleInstantMatch(userId, data) {
             matchScore: bestMatch.score
         };
         
-        memoryActiveMatches.set(matchId, match);
+        activeMatches.set(matchId, match);
+        await setActiveMatches(activeMatches);
         
         criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
         
@@ -520,34 +524,47 @@ async function handleInstantMatch(userId, data) {
         
     } else {
         // Add to waiting list
-        await addWaitingUser(userId, userInfo, chatZone);
+        const waitingUser = {
+            userId,
+            userInfo: userInfo || {},
+            chatZone: chatZone || null,
+            timestamp: Date.now()
+        };
         
-        const position = await getWaitingUserCount();
+        waitingUsers.set(userId, waitingUser);
+        await setWaitingUsers(waitingUsers);
+        
+        const position = waitingUsers.size;
         smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position})`);
         
         return createCorsResponse({
             status: 'waiting',
             position,
-            waitingUsers: position,
+            waitingUsers: waitingUsers.size,
             chatZone: chatZone,
             userGender: userGender,
             message: 'Added to matching queue. Waiting for partner...',
-            estimatedWaitTime: Math.min(position * 2, 30),
+            estimatedWaitTime: Math.min(waitingUsers.size * 2, 30),
             timestamp: Date.now()
         });
     }
 }
 
+// ==========================================
+// OTHER HANDLERS (Modified for KV)
+// ==========================================
+
 async function handleGetSignals(userId, data) {
     const { chatZone, gender } = data;
+    const activeMatches = await getActiveMatches();
     
-    // Check active matches
-    for (const [matchId, match] of memoryActiveMatches.entries()) {
+    for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             const partnerId = match.p1 === userId ? match.p2 : match.p1;
             const signals = match.signals[userId] || [];
             
             match.signals[userId] = [];
+            await setActiveMatches(activeMatches);
             
             smartLog('GET-SIGNALS', `${userId.slice(-8)} -> ${signals.length} signals`);
             
@@ -564,15 +581,13 @@ async function handleGetSignals(userId, data) {
         }
     }
     
-    const waitingUser = await getWaitingUser(userId);
-    if (waitingUser) {
-        const totalUsers = await getWaitingUserCount();
-        const position = Math.max(1, Math.floor(totalUsers * Math.random()) + 1);
-        
+    const waitingUsers = await getWaitingUsers();
+    if (waitingUsers.has(userId)) {
+        const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
         return createCorsResponse({
             status: 'waiting',
             position,
-            waitingUsers: totalUsers,
+            waitingUsers: waitingUsers.size,
             chatZone: chatZone,
             userGender: gender || 'Unspecified',
             timestamp: Date.now()
@@ -596,7 +611,9 @@ async function handleSendSignal(userId, data) {
         }, 400);
     }
     
-    const match = memoryActiveMatches.get(matchId);
+    const activeMatches = await getActiveMatches();
+    const match = activeMatches.get(matchId);
+    
     if (!match) {
         return createCorsResponse({ 
             error: 'Match not found',
@@ -623,9 +640,12 @@ async function handleSendSignal(userId, data) {
     
     match.signals[partnerId].push(signal);
     
+    // Limit queue size
     if (match.signals[partnerId].length > 100) {
         match.signals[partnerId] = match.signals[partnerId].slice(-50);
     }
+    
+    await setActiveMatches(activeMatches);
     
     smartLog('SEND-SIGNAL', `${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type})`);
     
@@ -644,11 +664,22 @@ async function handleP2pConnected(userId, data) {
     
     let removed = false;
     
-    const userRemoved = await removeWaitingUser(userId);
-    const partnerRemoved = await removeWaitingUser(partnerId);
-    removed = userRemoved || partnerRemoved;
+    const waitingUsers = await getWaitingUsers();
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        removed = true;
+    }
+    if (waitingUsers.has(partnerId)) {
+        waitingUsers.delete(partnerId);
+        removed = true;
+    }
+    if (removed) {
+        await setWaitingUsers(waitingUsers);
+    }
     
-    memoryActiveMatches.delete(matchId);
+    const activeMatches = await getActiveMatches();
+    activeMatches.delete(matchId);
+    await setActiveMatches(activeMatches);
     
     return createCorsResponse({
         status: 'p2p_connected',
@@ -662,10 +693,15 @@ async function handleDisconnect(userId) {
     
     let removed = false;
     
-    const userRemoved = await removeWaitingUser(userId);
-    if (userRemoved) removed = true;
+    const waitingUsers = await getWaitingUsers();
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        await setWaitingUsers(waitingUsers);
+        removed = true;
+    }
     
-    for (const [matchId, match] of memoryActiveMatches.entries()) {
+    const activeMatches = await getActiveMatches();
+    for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             const partnerId = match.p1 === userId ? match.p2 : match.p1;
             
@@ -679,7 +715,8 @@ async function handleDisconnect(userId) {
             }
             
             criticalLog('DISCONNECT', `Removing match ${matchId}`);
-            memoryActiveMatches.delete(matchId);
+            activeMatches.delete(matchId);
+            await setActiveMatches(activeMatches);
             removed = true;
             break;
         }
@@ -693,10 +730,80 @@ async function handleDisconnect(userId) {
 }
 
 // ==========================================
-// MAIN HANDLER FUNCTION
+// OPTIMIZED CLEANUP (Modified for KV)
+// ==========================================
+
+async function cleanup() {
+    const now = Date.now();
+    let cleanedUsers = 0;
+    let cleanedMatches = 0;
+    
+    // Cleanup waiting users
+    const waitingUsers = await getWaitingUsers();
+    const expiredUsers = [];
+    
+    for (const [userId, user] of waitingUsers.entries()) {
+        if (now - user.timestamp > USER_TIMEOUT) {
+            expiredUsers.push(userId);
+        }
+    }
+    
+    expiredUsers.forEach(userId => {
+        waitingUsers.delete(userId);
+        cleanedUsers++;
+    });
+    
+    if (cleanedUsers > 0) {
+        await setWaitingUsers(waitingUsers);
+    }
+    
+    // Cleanup active matches
+    const activeMatches = await getActiveMatches();
+    const expiredMatches = [];
+    
+    for (const [matchId, match] of activeMatches.entries()) {
+        if (now - match.timestamp > MATCH_LIFETIME) {
+            expiredMatches.push(matchId);
+        }
+    }
+    
+    expiredMatches.forEach(matchId => {
+        activeMatches.delete(matchId);
+        cleanedMatches++;
+    });
+    
+    if (cleanedMatches > 0) {
+        await setActiveMatches(activeMatches);
+    }
+    
+    // Capacity limit cleanup
+    if (waitingUsers.size > MAX_WAITING_USERS) {
+        const excess = waitingUsers.size - MAX_WAITING_USERS;
+        const oldestUsers = Array.from(waitingUsers.entries())
+            .sort((a, b) => a[1].timestamp - b[1].timestamp)
+            .slice(0, excess)
+            .map(entry => entry[0]);
+        
+        oldestUsers.forEach(userId => {
+            waitingUsers.delete(userId);
+            cleanedUsers++;
+        });
+        
+        await setWaitingUsers(waitingUsers);
+    }
+    
+    if (cleanedUsers > 0 || cleanedMatches > 0) {
+        criticalLog('CLEANUP', `Removed ${cleanedUsers} users, ${cleanedMatches} matches. Active: ${waitingUsers.size} waiting, ${activeMatches.size} matched`);
+    }
+}
+
+// ==========================================
+// MAIN HANDLER FUNCTION (Original with KV)
 // ==========================================
 
 export default async function handler(req) {
+    await cleanup();
+    
     if (req.method === 'OPTIONS') {
         return createCorsResponse(null, 200);
     }
@@ -706,34 +813,41 @@ export default async function handler(req) {
         const debug = url.searchParams.get('debug');
         
         if (debug === 'true') {
-            const waitingCount = await getWaitingUserCount();
+            const waitingUsers = await getWaitingUsers();
+            const activeMatches = await getActiveMatches();
             
             return createCorsResponse({
-                status: 'edge-compatible-webrtc-signaling',
+                status: 'vercel-kv-webrtc-signaling',
                 runtime: 'edge',
-                redis: process.env.REDIS_URL ? 'configured' : 'not-configured',
-                storage: 'hybrid-redis-memory',
+                storage: 'vercel-kv',
+                strategies: {
+                    simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
+                    hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
+                    optimized: `>${HYBRID_STRATEGY_THRESHOLD} users`
+                },
                 stats: {
-                    waitingUsers: waitingCount,
-                    activeMatches: memoryActiveMatches.size,
+                    waitingUsers: waitingUsers.size,
+                    activeMatches: activeMatches.size,
                     cacheSize: distanceCache.size
                 },
                 timestamp: Date.now()
             });
         }
         
-        const waitingCount = await getWaitingUserCount();
+        const waitingUsers = await getWaitingUsers();
+        const activeMatches = await getActiveMatches();
         
         return createCorsResponse({ 
-            status: 'edge-compatible-signaling-ready',
+            status: 'vercel-kv-signaling-ready',
             runtime: 'edge',
-            redis: process.env.REDIS_URL ? 'available' : 'fallback-memory',
+            storage: 'vercel-kv',
             stats: { 
-                waiting: waitingCount, 
-                matches: memoryActiveMatches.size,
-                strategy: 'simple'
+                waiting: waitingUsers.size, 
+                matches: activeMatches.size,
+                strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
+                         waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
             },
-            message: 'Edge-compatible WebRTC signaling server ready',
+            message: 'Vercel KV WebRTC signaling server ready',
             timestamp: Date.now()
         });
     }
@@ -743,16 +857,13 @@ export default async function handler(req) {
     }
     
     try {
-        // FLEXIBLE JSON PARSING (like original code)
+        // FLEXIBLE JSON PARSING (Original logic)
         let data;
         let requestBody = '';
         
         try {
             data = await req.json();
-            criticalLog('REQUEST-RECEIVED', 'JSON parsed successfully:', JSON.stringify(data));
         } catch (jsonError) {
-            criticalLog('REQUEST-DEBUG', 'JSON parse failed, trying manual parsing:', jsonError.message);
-            
             if (!req.body) {
                 return createCorsResponse({ 
                     error: 'No request body found',
@@ -760,80 +871,55 @@ export default async function handler(req) {
                 }, 400);
             }
             
-            try {
-                const reader = req.body.getReader();
-                const decoder = new TextDecoder();
-                
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    requestBody += decoder.decode(value, { stream: true });
-                }
-                
-                criticalLog('REQUEST-DEBUG', 'Raw body received:', requestBody);
-                
-                if (!requestBody.trim()) {
-                    return createCorsResponse({ 
-                        error: 'Empty request body',
-                        tip: 'Send JSON data'
-                    }, 400);
-                }
-                
-                // Try to parse the body
-                data = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
-                criticalLog('REQUEST-RECEIVED', 'Manual parse successful:', JSON.stringify(data));
-                
-            } catch (parseError) {
-                criticalLog('REQUEST-ERROR', 'All parsing failed:', parseError.message, 'Body:', requestBody);
+            const reader = req.body.getReader();
+            const decoder = new TextDecoder();
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                requestBody += decoder.decode(value, { stream: true });
+            }
+            
+            if (!requestBody.trim()) {
                 return createCorsResponse({ 
-                    error: 'Failed to parse request body',
-                    details: parseError.message,
-                    receivedBody: requestBody.substring(0, 200) // First 200 chars for debug
+                    error: 'Empty request body',
+                    tip: 'Send JSON data'
                 }, 400);
             }
+            
+            data = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
         }
         
         const { action, userId, chatZone } = data;
         
-        // Enhanced validation with debug
         if (!userId) {
-            criticalLog('VALIDATION-ERROR', 'Missing userId in data:', JSON.stringify(data));
             return createCorsResponse({ 
                 error: 'userId is required',
-                tip: 'Include userId in your JSON',
-                received: data
+                tip: 'Include userId in your JSON'
             }, 400);
         }
         
         if (!action) {
-            criticalLog('VALIDATION-ERROR', 'Missing action in data:', JSON.stringify(data));
             return createCorsResponse({ 
                 error: 'action is required',
-                validActions: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect'],
-                received: data
+                validActions: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect']
             }, 400);
         }
         
-        criticalLog(`${action.toUpperCase()}`, `${userId.slice(-8)} (Zone: ${chatZone || 'N/A'}) - Starting handler`);
+        criticalLog(`${action.toUpperCase()}`, `${userId.slice(-8)} (Zone: ${chatZone || 'N/A'})`);
         
         switch (action) {
             case 'instant-match': 
-                criticalLog('HANDLER', 'Calling handleInstantMatch with data:', JSON.stringify(data));
                 return await handleInstantMatch(userId, data);
             case 'get-signals': 
-                criticalLog('HANDLER', 'Calling handleGetSignals');
                 return await handleGetSignals(userId, data);
             case 'send-signal': 
-                criticalLog('HANDLER', 'Calling handleSendSignal');
                 return await handleSendSignal(userId, data);                
             case 'p2p-connected': 
-                criticalLog('HANDLER', 'Calling handleP2pConnected');
                 return await handleP2pConnected(userId, data);      
             case 'disconnect': 
-                criticalLog('HANDLER', 'Calling handleDisconnect');
                 return await handleDisconnect(userId);
             default: 
-                criticalLog('HANDLER-ERROR', 'Unknown action:', action);
                 return createCorsResponse({ error: `Unknown action: ${action}` }, 400);
         }
     } catch (error) {
@@ -846,3 +932,4 @@ export default async function handler(req) {
     }
 }
 
+export const config = { runtime: 'edge' };
