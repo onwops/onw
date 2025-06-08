@@ -221,7 +221,8 @@ function createCorsResponse(data, status = 200) {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type'
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Max-Age': '86400'
         }
     });
 }
@@ -742,45 +743,97 @@ export default async function handler(req) {
     }
     
     try {
+        // FLEXIBLE JSON PARSING (like original code)
         let data;
+        let requestBody = '';
         
         try {
             data = await req.json();
+            criticalLog('REQUEST-RECEIVED', 'JSON parsed successfully:', JSON.stringify(data));
         } catch (jsonError) {
-            return createCorsResponse({ 
-                error: 'Invalid JSON in request body'
-            }, 400);
+            criticalLog('REQUEST-DEBUG', 'JSON parse failed, trying manual parsing:', jsonError.message);
+            
+            if (!req.body) {
+                return createCorsResponse({ 
+                    error: 'No request body found',
+                    tip: 'Send JSON body with your POST request'
+                }, 400);
+            }
+            
+            try {
+                const reader = req.body.getReader();
+                const decoder = new TextDecoder();
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    requestBody += decoder.decode(value, { stream: true });
+                }
+                
+                criticalLog('REQUEST-DEBUG', 'Raw body received:', requestBody);
+                
+                if (!requestBody.trim()) {
+                    return createCorsResponse({ 
+                        error: 'Empty request body',
+                        tip: 'Send JSON data'
+                    }, 400);
+                }
+                
+                // Try to parse the body
+                data = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
+                criticalLog('REQUEST-RECEIVED', 'Manual parse successful:', JSON.stringify(data));
+                
+            } catch (parseError) {
+                criticalLog('REQUEST-ERROR', 'All parsing failed:', parseError.message, 'Body:', requestBody);
+                return createCorsResponse({ 
+                    error: 'Failed to parse request body',
+                    details: parseError.message,
+                    receivedBody: requestBody.substring(0, 200) // First 200 chars for debug
+                }, 400);
+            }
         }
         
         const { action, userId, chatZone } = data;
         
+        // Enhanced validation with debug
         if (!userId) {
+            criticalLog('VALIDATION-ERROR', 'Missing userId in data:', JSON.stringify(data));
             return createCorsResponse({ 
-                error: 'userId is required'
+                error: 'userId is required',
+                tip: 'Include userId in your JSON',
+                received: data
             }, 400);
         }
         
         if (!action) {
+            criticalLog('VALIDATION-ERROR', 'Missing action in data:', JSON.stringify(data));
             return createCorsResponse({ 
                 error: 'action is required',
-                validActions: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect']
+                validActions: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect'],
+                received: data
             }, 400);
         }
         
-        criticalLog(`${action.toUpperCase()}`, `${userId.slice(-8)} (Zone: ${chatZone || 'N/A'})`);
+        criticalLog(`${action.toUpperCase()}`, `${userId.slice(-8)} (Zone: ${chatZone || 'N/A'}) - Starting handler`);
         
         switch (action) {
             case 'instant-match': 
+                criticalLog('HANDLER', 'Calling handleInstantMatch with data:', JSON.stringify(data));
                 return await handleInstantMatch(userId, data);
             case 'get-signals': 
+                criticalLog('HANDLER', 'Calling handleGetSignals');
                 return await handleGetSignals(userId, data);
             case 'send-signal': 
+                criticalLog('HANDLER', 'Calling handleSendSignal');
                 return await handleSendSignal(userId, data);                
             case 'p2p-connected': 
+                criticalLog('HANDLER', 'Calling handleP2pConnected');
                 return await handleP2pConnected(userId, data);      
             case 'disconnect': 
+                criticalLog('HANDLER', 'Calling handleDisconnect');
                 return await handleDisconnect(userId);
             default: 
+                criticalLog('HANDLER-ERROR', 'Unknown action:', action);
                 return createCorsResponse({ error: `Unknown action: ${action}` }, 400);
         }
     } catch (error) {
@@ -793,4 +846,3 @@ export default async function handler(req) {
     }
 }
 
- 
