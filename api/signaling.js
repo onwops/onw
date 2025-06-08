@@ -1,4 +1,4 @@
-// 🚀 ORIGINAL WebRTC Signaling Server (Memory-based, Multi-instance compatible)
+// 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server
 
 const ENABLE_DETAILED_LOGGING = false;
 
@@ -52,13 +52,6 @@ let signalObjectPool = [];
 // PERFORMANCE MONITORING
 // ==========================================
 
-let requestCount = 0;
-let matchingStats = {
-    totalMatches: 0,
-    avgMatchTime: 0,
-    lastMatch: 0
-};
-let lastResetTime = Date.now();
 
 // ==========================================
 // LOGGING UTILITIES
@@ -432,22 +425,17 @@ function handleInstantMatch(userId, data) {
     if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
         // Very small pool - use simple linear search (fastest for small data)
         bestMatch = findSimpleMatch(userId, chatZone, userGender);
-        strategy = 'simple';
         
     } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
         // Medium pool - use hybrid approach
         bestMatch = findHybridMatch(userId, chatZone, userGender);
-        strategy = 'hybrid';
         
     } else {
         // Large pool - use full optimization
         buildIndexesIfNeeded();
         bestMatch = findUltraFastMatch(userId, chatZone, userGender);
-        strategy = 'optimized';
     }
     
-    const matchTime = Date.now() - startTime;
-    requestCount++;
     
     if (bestMatch) {
         const partnerId = bestMatch.userId;
@@ -482,12 +470,7 @@ function handleInstantMatch(userId, data) {
         
         activeMatches.set(matchId, match);
         
-        // Update stats
-        matchingStats.totalMatches++;
-        matchingStats.avgMatchTime = (matchingStats.avgMatchTime + matchTime) / 2;
-        matchingStats.lastMatch = Date.now();
-        
-        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score} | Strategy: ${strategy} | Time: ${matchTime}ms`);
+        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
         
         return createCorsResponse({
             status: 'instant-match',
@@ -515,7 +498,7 @@ function handleInstantMatch(userId, data) {
         indexDirty = true;
         
         const position = waitingUsers.size;
-        smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position}) | Strategy: ${strategy} | Time: ${matchTime}ms`);
+        smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position})`);
         
         return createCorsResponse({
             status: 'waiting',
@@ -771,9 +754,8 @@ export default async function handler(req) {
         
         if (debug === 'true') {
             return createCorsResponse({
-                status: 'original-memory-webrtc-signaling',
+                status: 'hybrid-optimized-webrtc-signaling',
                 runtime: 'edge',
-                storage: 'memory',
                 strategies: {
                     simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
                     hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
@@ -800,16 +782,15 @@ export default async function handler(req) {
         }
         
         return createCorsResponse({ 
-            status: 'original-memory-signaling-ready',
+            status: 'hybrid-optimized-signaling-ready',
             runtime: 'edge',
-            storage: 'memory',
             stats: { 
                 waiting: waitingUsers.size, 
                 matches: activeMatches.size,
                 strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
                          waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
             },
-            message: 'Original memory-based WebRTC signaling server ready',
+            message: 'Hybrid-optimized WebRTC signaling server ready',
             timestamp: Date.now()
         });
     }
@@ -864,6 +845,7 @@ export default async function handler(req) {
         if (!action) {
             return createCorsResponse({ 
                 error: 'action is required',
+                validActions: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect']
             }, 400);
         }
         
@@ -892,5 +874,6 @@ export default async function handler(req) {
         }, 500);
     }
 }
+
 
 export const config = { runtime: 'edge' };
