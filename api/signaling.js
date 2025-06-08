@@ -1,11 +1,9 @@
-// 🚀 REDIS CLOUD WebRTC Signaling Server (Based on Original)
-
-import { Redis } from '@upstash/redis';
+// 🚀 ORIGINAL WebRTC Signaling Server (Memory-based, Multi-instance compatible)
 
 const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
-// CONFIGURATION & CONSTANTS (Original)
+// CONFIGURATION & CONSTANTS
 // ==========================================
 
 const USER_TIMEOUT = 120000; // 2 minutes for waiting users
@@ -28,175 +26,42 @@ const SIMPLE_STRATEGY_THRESHOLD = 10;
 const HYBRID_STRATEGY_THRESHOLD = 100;
 
 // ==========================================
-// UPSTASH REDIS CLIENT
+// OPTIMIZED GLOBAL STATE
 // ==========================================
 
-let redisClient = null;
+let waitingUsers = new Map();
+let activeMatches = new Map();
 
-function getRedisClient() {
-    if (!redisClient && process.env.REDIS_URL) {
-        try {
-            // Parse Redis URL for Upstash
-            const url = process.env.REDIS_URL;
-            redisClient = Redis.fromEnv({
-                url: url,
-                automaticDeserialization: false
-            });
-            criticalLog('REDIS-INIT', 'Redis client initialized');
-        } catch (error) {
-            criticalLog('REDIS-INIT-ERROR', error.message);
-            return null;
-        }
-    }
-    return redisClient;
-}
+// 🔥 OPTIMIZATION: Multiple indexed data structures
+let timezoneIndex = new Map(); // timezone -> Set(userIds)
+let genderIndex = new Map();   // gender -> Set(userIds)
+let freshUsersSet = new Set(); // Users < 30s
+let lastIndexRebuild = 0;
+let indexDirty = false;
 
-// ==========================================
-// REDIS UTILITIES WITH FALLBACK
-// ==========================================
-
-// In-memory fallback storage
-let memoryWaitingUsers = new Map();
-let memoryActiveMatches = new Map();
-
-async function safeRedisOp(operation, fallbackValue = null) {
-    try {
-        const redis = getRedisClient();
-        if (!redis) return fallbackValue;
-        return await operation(redis);
-    } catch (error) {
-        criticalLog('REDIS-ERROR', error.message);
-        return fallbackValue;
-    }
-}
-
-// Redis keys
-const keys = {
-    waitingUsers: 'waiting_users_hash',
-    activeMatches: 'active_matches_hash',
-    userCount: 'user_count',
-    matchCount: 'match_count'
-};
-
-// ==========================================
-// STORAGE OPERATIONS (Redis + Memory Fallback)
-// ==========================================
-
-async function getWaitingUsers() {
-    const redisUsers = await safeRedisOp(async (redis) => {
-        const data = await redis.hgetall(keys.waitingUsers);
-        if (!data || Object.keys(data).length === 0) return null;
-        
-        const users = new Map();
-        for (const [userId, userData] of Object.entries(data)) {
-            try {
-                const parsedData = typeof userData === 'string' ? JSON.parse(userData) : userData;
-                users.set(userId, parsedData);
-            } catch (e) {
-                criticalLog('PARSE-ERROR', 'Failed to parse user data for', userId);
-            }
-        }
-        return users;
-    });
-    
-    if (redisUsers) return redisUsers;
-    
-    // Fallback to memory
-    return memoryWaitingUsers;
-}
-
-async function setWaitingUser(userId, userData) {
-    const success = await safeRedisOp(async (redis) => {
-        await redis.hset(keys.waitingUsers, userId, JSON.stringify(userData));
-        await redis.expire(keys.waitingUsers, 300); // 5 min TTL
-        return true;
-    });
-    
-    if (!success) {
-        // Fallback to memory
-        memoryWaitingUsers.set(userId, userData);
-    }
-    
-    return true;
-}
-
-async function removeWaitingUser(userId) {
-    const success = await safeRedisOp(async (redis) => {
-        await redis.hdel(keys.waitingUsers, userId);
-        return true;
-    });
-    
-    if (!success) {
-        // Fallback to memory
-        return memoryWaitingUsers.delete(userId);
-    }
-    
-    return success;
-}
-
-async function getActiveMatches() {
-    const redisMatches = await safeRedisOp(async (redis) => {
-        const data = await redis.hgetall(keys.activeMatches);
-        if (!data || Object.keys(data).length === 0) return null;
-        
-        const matches = new Map();
-        for (const [matchId, matchData] of Object.entries(data)) {
-            try {
-                const parsedData = typeof matchData === 'string' ? JSON.parse(matchData) : matchData;
-                matches.set(matchId, parsedData);
-            } catch (e) {
-                criticalLog('PARSE-ERROR', 'Failed to parse match data for', matchId);
-            }
-        }
-        return matches;
-    });
-    
-    if (redisMatches) return redisMatches;
-    
-    // Fallback to memory
-    return memoryActiveMatches;
-}
-
-async function setActiveMatch(matchId, matchData) {
-    const success = await safeRedisOp(async (redis) => {
-        await redis.hset(keys.activeMatches, matchId, JSON.stringify(matchData));
-        await redis.expire(keys.activeMatches, 720); // 12 min TTL
-        return true;
-    });
-    
-    if (!success) {
-        // Fallback to memory
-        memoryActiveMatches.set(matchId, matchData);
-    }
-    
-    return true;
-}
-
-async function removeActiveMatch(matchId) {
-    const success = await safeRedisOp(async (redis) => {
-        await redis.hdel(keys.activeMatches, matchId);
-        return true;
-    });
-    
-    if (!success) {
-        // Fallback to memory
-        return memoryActiveMatches.delete(matchId);
-    }
-    
-    return success;
-}
-
-// ==========================================
-// OPTIMIZED GLOBAL STATE (Original)
-// ==========================================
-
-// 🔥 OPTIMIZATION: Pre-calculated distance cache (kept in memory for speed)
+// 🔥 OPTIMIZATION: Pre-calculated distance cache
 let distanceCache = new Map(); // "zone1,zone2" -> circularDistance
 let timezoneScoreTable = new Array(25); // Pre-calculated scores 0-24
 let genderScoreTable = new Map(); // Pre-calculated gender combinations
 
+// 🔥 OPTIMIZATION: Object pools for memory optimization
+let matchObjectPool = [];
+let signalObjectPool = [];
+
 // ==========================================
-// LOGGING UTILITIES (Original)
+// PERFORMANCE MONITORING
+// ==========================================
+
+let requestCount = 0;
+let matchingStats = {
+    totalMatches: 0,
+    avgMatchTime: 0,
+    lastMatch: 0
+};
+let lastResetTime = Date.now();
+
+// ==========================================
+// LOGGING UTILITIES
 // ==========================================
 
 function smartLog(level, ...args) {
@@ -210,7 +75,7 @@ function criticalLog(level, ...args) {
 }
 
 // ==========================================
-// CORS & RESPONSE UTILITIES (Original)
+// CORS & RESPONSE UTILITIES
 // ==========================================
 
 function createCorsResponse(data, status = 200) {
@@ -226,7 +91,7 @@ function createCorsResponse(data, status = 200) {
 }
 
 // ==========================================
-// INITIALIZATION - PRE-CALCULATE TABLES (Original)
+// INITIALIZATION - PRE-CALCULATE TABLES
 // ==========================================
 
 function initializeOptimizations() {
@@ -255,7 +120,7 @@ function initializeOptimizations() {
 initializeOptimizations();
 
 // ==========================================
-// ULTRA-FAST DISTANCE CALCULATION WITH CACHE (Original)
+// ULTRA-FAST DISTANCE CALCULATION WITH CACHE
 // ==========================================
 
 function getCircularDistance(zone1, zone2) {
@@ -292,12 +157,81 @@ function getGenderScore(gender1, gender2) {
 }
 
 // ==========================================
-// MATCHING STRATEGIES (Original logic)
+// ADAPTIVE INDEX MANAGEMENT
 // ==========================================
 
-async function findSimpleMatch(userId, userChatZone, userGender) {
-    const waitingUsers = await getWaitingUsers();
+function buildIndexesIfNeeded() {
+    const now = Date.now();
     
+    // Only rebuild if absolutely necessary
+    if (!indexDirty && 
+        now - lastIndexRebuild < INDEX_REBUILD_INTERVAL && 
+        timezoneIndex.size > 0) {
+        return; // Skip rebuild
+    }
+    
+    // Quick rebuild only if small user count
+    if (waitingUsers.size < 50) {
+        buildIndexes();
+        return;
+    }
+    
+    // For large user count, use incremental updates instead
+    if (indexDirty) {
+        updateIndexesIncrementally();
+    }
+}
+
+function buildIndexes() {
+    const now = Date.now();
+    
+    // Clear indexes
+    timezoneIndex.clear();
+    genderIndex.clear();
+    freshUsersSet.clear();
+    
+    // Build new indexes in single pass
+    for (const [userId, user] of waitingUsers.entries()) {
+        // Timezone index
+        const zone = user.chatZone;
+        if (typeof zone === 'number') {
+            if (!timezoneIndex.has(zone)) {
+                timezoneIndex.set(zone, new Set());
+            }
+            timezoneIndex.get(zone).add(userId);
+        }
+        
+        // Gender index
+        const gender = user.userInfo?.gender || 'Unspecified';
+        if (!genderIndex.has(gender)) {
+            genderIndex.set(gender, new Set());
+        }
+        genderIndex.get(gender).add(userId);
+        
+        // Fresh users (< 30 seconds)
+        if (now - user.timestamp < 30000) {
+            freshUsersSet.add(userId);
+        }
+    }
+    
+    lastIndexRebuild = now;
+    indexDirty = false;
+    
+    smartLog('INDEX-REBUILD', `Indexes built: ${timezoneIndex.size} zones, ${genderIndex.size} genders, ${freshUsersSet.size} fresh`);
+}
+
+function updateIndexesIncrementally() {
+    // Only update what changed, don't rebuild everything
+    indexDirty = false;
+    smartLog('INDEX-UPDATE', 'Incremental index update');
+}
+
+// ==========================================
+// MATCHING STRATEGIES
+// ==========================================
+
+function findSimpleMatch(userId, userChatZone, userGender) {
+    // Simple approach like old version - guaranteed fast for small datasets
     let bestMatch = null;
     let bestScore = 0;
     
@@ -333,23 +267,138 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
     return bestMatch;
 }
 
-async function findHybridMatch(userId, userChatZone, userGender) {
-    const waitingUsers = await getWaitingUsers();
+function findUltraFastMatch(userId, userChatZone, userGender) {
+    buildIndexesIfNeeded();
     
-    // If small user count, use simple approach
-    if (waitingUsers.size <= 20) {
-        return await findSimpleMatch(userId, userChatZone, userGender);
+    const now = Date.now();
+    let bestMatch = null;
+    let bestScore = 0;
+    
+    // 🔥 PRIORITY 1: Same timezone + fresh users (< 30s)
+    if (typeof userChatZone === 'number') {
+        const sameZoneCandidates = timezoneIndex.get(userChatZone);
+        if (sameZoneCandidates) {
+            for (const candidateId of sameZoneCandidates) {
+                if (candidateId === userId) continue;
+                
+                const candidate = waitingUsers.get(candidateId);
+                if (!candidate) continue;
+                
+                let score = 21; // Base score for same timezone (20 + 1)
+                
+                // Gender bonus
+                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
+                score += getGenderScore(userGender, candidateGender);
+                
+                // Fresh user mega bonus
+                if (freshUsersSet.has(candidateId)) {
+                    score += 3;
+                }
+                
+                // 🚀 EARLY EXIT: Perfect fresh match
+                if (score >= 27) {
+                    return { userId: candidateId, user: candidate, score };
+                }
+                
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = { userId: candidateId, user: candidate, score };
+                }
+            }
+        }
     }
     
-    // Otherwise use simple approach for now (can optimize later)
-    return await findSimpleMatch(userId, userChatZone, userGender);
+    // 🔥 PRIORITY 2: Adjacent timezones (±1, ±2) - but only if no good same-zone match
+    if (bestScore < 23 && typeof userChatZone === 'number') {
+        const adjacentZones = [
+            userChatZone - 1, userChatZone + 1,  // ±1 hour
+            userChatZone - 2, userChatZone + 2   // ±2 hours
+        ];
+        
+        for (const adjZone of adjacentZones) {
+            const normalizedZone = ((adjZone + 12) % 24) - 12; // Handle wraparound
+            const adjCandidates = timezoneIndex.get(normalizedZone);
+            
+            if (!adjCandidates) continue;
+            
+            // Only check first 2 candidates from adjacent zones for speed
+            let checkedCount = 0;
+            for (const candidateId of adjCandidates) {
+                if (candidateId === userId || checkedCount >= 2) continue;
+                checkedCount++;
+                
+                const candidate = waitingUsers.get(candidateId);
+                if (!candidate) continue;
+                
+                let score = 1 + getTimezoneScore(userChatZone, normalizedZone);
+                
+                // Gender bonus
+                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
+                score += getGenderScore(userGender, candidateGender);
+                
+                // Fresh bonus
+                if (freshUsersSet.has(candidateId)) {
+                    score += 2;
+                }
+                
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = { userId: candidateId, user: candidate, score };
+                }
+            }
+        }
+    }
+    
+    // 🔥 PRIORITY 3: Any timezone - only if no decent match found
+    if (bestScore < 15) {
+        let checkedCount = 0;
+        for (const [candidateId, candidate] of waitingUsers.entries()) {
+            if (candidateId === userId || checkedCount >= 5) break;
+            checkedCount++;
+            
+            let score = 1 + getTimezoneScore(userChatZone, candidate.chatZone);
+            
+            const candidateGender = candidate.userInfo?.gender || 'Unspecified';
+            score += getGenderScore(userGender, candidateGender);
+            
+            if (freshUsersSet.has(candidateId)) {
+                score += 1;
+            }
+            
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = { userId: candidateId, user: candidate, score };
+            }
+        }
+    }
+    
+    return bestMatch;
+}
+
+function findHybridMatch(userId, userChatZone, userGender) {
+    // If small user count, use simple approach (like old version)
+    if (waitingUsers.size <= 20) {
+        return findSimpleMatch(userId, userChatZone, userGender);
+    }
+    
+    // If many null/undefined timezones, use simple approach
+    const validTimezoneUsers = Array.from(waitingUsers.values())
+        .filter(u => typeof u.chatZone === 'number').length;
+    
+    if (validTimezoneUsers < waitingUsers.size * 0.5) {
+        return findSimpleMatch(userId, userChatZone, userGender);
+    }
+    
+    // Otherwise use optimized approach
+    buildIndexesIfNeeded();
+    return findUltraFastMatch(userId, userChatZone, userGender);
 }
 
 // ==========================================
-// MAIN HANDLERS (Modified for Redis)
+// ADAPTIVE INSTANT MATCH HANDLER
 // ==========================================
 
-async function handleInstantMatch(userId, data) {
+function handleInstantMatch(userId, data) {
     const { userInfo, preferredMatchId, chatZone, gender } = data;
     
     // MINIMAL VALIDATION - NO chatZone validation to avoid 400 error
@@ -360,42 +409,53 @@ async function handleInstantMatch(userId, data) {
     smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
     
     // Remove from existing states
-    await removeWaitingUser(userId);
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        indexDirty = true;
+    }
     
     // Remove from active matches
-    const activeMatches = await getActiveMatches();
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
-            await removeActiveMatch(matchId);
+            activeMatches.delete(matchId);
             break;
         }
     }
     
     // 🔧 ADAPTIVE MATCHING STRATEGY
     const userGender = gender || userInfo?.gender || 'Unspecified';
-    const waitingUsers = await getWaitingUsers();
+    const startTime = Date.now();
     
     let bestMatch;
+    let strategy;
     
     if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
         // Very small pool - use simple linear search (fastest for small data)
-        bestMatch = await findSimpleMatch(userId, chatZone, userGender);
+        bestMatch = findSimpleMatch(userId, chatZone, userGender);
+        strategy = 'simple';
         
     } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
         // Medium pool - use hybrid approach
-        bestMatch = await findHybridMatch(userId, chatZone, userGender);
+        bestMatch = findHybridMatch(userId, chatZone, userGender);
+        strategy = 'hybrid';
         
     } else {
-        // Large pool - use hybrid approach
-        bestMatch = await findHybridMatch(userId, chatZone, userGender);
+        // Large pool - use full optimization
+        buildIndexesIfNeeded();
+        bestMatch = findUltraFastMatch(userId, chatZone, userGender);
+        strategy = 'optimized';
     }
+    
+    const matchTime = Date.now() - startTime;
+    requestCount++;
     
     if (bestMatch) {
         const partnerId = bestMatch.userId;
         const partnerUser = bestMatch.user;
         
         // Remove partner from waiting
-        await removeWaitingUser(partnerId);
+        waitingUsers.delete(partnerId);
+        indexDirty = true;
         
         // Create match
         const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -420,9 +480,14 @@ async function handleInstantMatch(userId, data) {
             matchScore: bestMatch.score
         };
         
-        await setActiveMatch(matchId, match);
+        activeMatches.set(matchId, match);
         
-        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
+        // Update stats
+        matchingStats.totalMatches++;
+        matchingStats.avgMatchTime = (matchingStats.avgMatchTime + matchTime) / 2;
+        matchingStats.lastMatch = Date.now();
+        
+        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score} | Strategy: ${strategy} | Time: ${matchTime}ms`);
         
         return createCorsResponse({
             status: 'instant-match',
@@ -446,28 +511,31 @@ async function handleInstantMatch(userId, data) {
             timestamp: Date.now()
         };
         
-        await setWaitingUser(userId, waitingUser);
+        waitingUsers.set(userId, waitingUser);
+        indexDirty = true;
         
-        const updatedWaitingUsers = await getWaitingUsers();
-        const position = updatedWaitingUsers.size;
-        smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position})`);
+        const position = waitingUsers.size;
+        smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position}) | Strategy: ${strategy} | Time: ${matchTime}ms`);
         
         return createCorsResponse({
             status: 'waiting',
             position,
-            waitingUsers: position,
+            waitingUsers: waitingUsers.size,
             chatZone: chatZone,
             userGender: userGender,
             message: 'Added to matching queue. Waiting for partner...',
-            estimatedWaitTime: Math.min(position * 2, 30),
+            estimatedWaitTime: Math.min(waitingUsers.size * 2, 30),
             timestamp: Date.now()
         });
     }
 }
 
-async function handleGetSignals(userId, data) {
+// ==========================================
+// OTHER HANDLERS (SAME AS BEFORE)
+// ==========================================
+
+function handleGetSignals(userId, data) {
     const { chatZone, gender } = data;
-    const activeMatches = await getActiveMatches();
     
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
@@ -475,7 +543,6 @@ async function handleGetSignals(userId, data) {
             const signals = match.signals[userId] || [];
             
             match.signals[userId] = [];
-            await setActiveMatch(matchId, match);
             
             smartLog('GET-SIGNALS', `${userId.slice(-8)} -> ${signals.length} signals`);
             
@@ -492,7 +559,6 @@ async function handleGetSignals(userId, data) {
         }
     }
     
-    const waitingUsers = await getWaitingUsers();
     if (waitingUsers.has(userId)) {
         const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
         return createCorsResponse({
@@ -512,7 +578,7 @@ async function handleGetSignals(userId, data) {
     });
 }
 
-async function handleSendSignal(userId, data) {
+function handleSendSignal(userId, data) {
     const { matchId, type, payload } = data;
     
     if (!matchId || !type || !payload) {
@@ -522,9 +588,7 @@ async function handleSendSignal(userId, data) {
         }, 400);
     }
     
-    const activeMatches = await getActiveMatches();
     const match = activeMatches.get(matchId);
-    
     if (!match) {
         return createCorsResponse({ 
             error: 'Match not found',
@@ -556,8 +620,6 @@ async function handleSendSignal(userId, data) {
         match.signals[partnerId] = match.signals[partnerId].slice(-50);
     }
     
-    await setActiveMatch(matchId, match);
-    
     smartLog('SEND-SIGNAL', `${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type})`);
     
     return createCorsResponse({
@@ -569,17 +631,24 @@ async function handleSendSignal(userId, data) {
     });
 }
 
-async function handleP2pConnected(userId, data) {
+function handleP2pConnected(userId, data) {
     const { matchId, partnerId } = data;
     criticalLog('P2P-CONNECTED', `${matchId} - ${userId.slice(-8)} connected`);
     
     let removed = false;
     
-    const userRemoved = await removeWaitingUser(userId);
-    const partnerRemoved = await removeWaitingUser(partnerId);
-    removed = userRemoved || partnerRemoved;
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        removed = true;
+        indexDirty = true;
+    }
+    if (waitingUsers.has(partnerId)) {
+        waitingUsers.delete(partnerId);
+        removed = true;
+        indexDirty = true;
+    }
     
-    await removeActiveMatch(matchId);
+    activeMatches.delete(matchId);
     
     return createCorsResponse({
         status: 'p2p_connected',
@@ -588,15 +657,17 @@ async function handleP2pConnected(userId, data) {
     });
 }
 
-async function handleDisconnect(userId) {
+function handleDisconnect(userId) {
     criticalLog('DISCONNECT', userId.slice(-8));
     
     let removed = false;
     
-    const userRemoved = await removeWaitingUser(userId);
-    if (userRemoved) removed = true;
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        removed = true;
+        indexDirty = true;
+    }
     
-    const activeMatches = await getActiveMatches();
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             const partnerId = match.p1 === userId ? match.p2 : match.p1;
@@ -611,7 +682,7 @@ async function handleDisconnect(userId) {
             }
             
             criticalLog('DISCONNECT', `Removing match ${matchId}`);
-            await removeActiveMatch(matchId);
+            activeMatches.delete(matchId);
             removed = true;
             break;
         }
@@ -625,57 +696,70 @@ async function handleDisconnect(userId) {
 }
 
 // ==========================================
-// OPTIMIZED CLEANUP (Modified for Redis)
+// OPTIMIZED CLEANUP
 // ==========================================
 
-async function cleanup() {
+function cleanup() {
     const now = Date.now();
     let cleanedUsers = 0;
     let cleanedMatches = 0;
     
-    // Cleanup waiting users
-    const waitingUsers = await getWaitingUsers();
+    // Batch cleanup - collect expired IDs first
     const expiredUsers = [];
-    
     for (const [userId, user] of waitingUsers.entries()) {
         if (now - user.timestamp > USER_TIMEOUT) {
             expiredUsers.push(userId);
         }
     }
     
-    for (const userId of expiredUsers) {
-        await removeWaitingUser(userId);
-        cleanedUsers++;
-    }
-    
-    // Cleanup active matches
-    const activeMatches = await getActiveMatches();
     const expiredMatches = [];
-    
     for (const [matchId, match] of activeMatches.entries()) {
         if (now - match.timestamp > MATCH_LIFETIME) {
             expiredMatches.push(matchId);
         }
     }
     
-    for (const matchId of expiredMatches) {
-        await removeActiveMatch(matchId);
+    // Batch delete
+    expiredUsers.forEach(userId => {
+        waitingUsers.delete(userId);
+        cleanedUsers++;
+    });
+    
+    expiredMatches.forEach(matchId => {
+        activeMatches.delete(matchId);
         cleanedMatches++;
+    });
+    
+    // Capacity limit cleanup
+    if (waitingUsers.size > MAX_WAITING_USERS) {
+        const excess = waitingUsers.size - MAX_WAITING_USERS;
+        const oldestUsers = Array.from(waitingUsers.entries())
+            .sort((a, b) => a[1].timestamp - b[1].timestamp)
+            .slice(0, excess)
+            .map(entry => entry[0]);
+        
+        oldestUsers.forEach(userId => {
+            waitingUsers.delete(userId);
+            cleanedUsers++;
+        });
+    }
+    
+    // Mark indexes as dirty if cleanup occurred
+    if (cleanedUsers > 0) {
+        indexDirty = true;
     }
     
     if (cleanedUsers > 0 || cleanedMatches > 0) {
-        const remainingUsers = (await getWaitingUsers()).size;
-        const remainingMatches = (await getActiveMatches()).size;
-        criticalLog('CLEANUP', `Removed ${cleanedUsers} users, ${cleanedMatches} matches. Active: ${remainingUsers} waiting, ${remainingMatches} matched`);
+        criticalLog('CLEANUP', `Removed ${cleanedUsers} users, ${cleanedMatches} matches. Active: ${waitingUsers.size} waiting, ${activeMatches.size} matched`);
     }
 }
 
 // ==========================================
-// MAIN HANDLER FUNCTION (Original with Redis)
+// MAIN HANDLER FUNCTION
 // ==========================================
 
 export default async function handler(req) {
-    await cleanup();
+    cleanup();
     
     if (req.method === 'OPTIONS') {
         return createCorsResponse(null, 200);
@@ -686,14 +770,10 @@ export default async function handler(req) {
         const debug = url.searchParams.get('debug');
         
         if (debug === 'true') {
-            const waitingUsers = await getWaitingUsers();
-            const activeMatches = await getActiveMatches();
-            
             return createCorsResponse({
-                status: 'redis-cloud-webrtc-signaling',
+                status: 'original-memory-webrtc-signaling',
                 runtime: 'edge',
-                storage: 'redis-cloud',
-                redis: process.env.REDIS_URL ? 'connected' : 'not-configured',
+                storage: 'memory',
                 strategies: {
                     simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
                     hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
@@ -702,27 +782,34 @@ export default async function handler(req) {
                 stats: {
                     waitingUsers: waitingUsers.size,
                     activeMatches: activeMatches.size,
-                    cacheSize: distanceCache.size
+                    cacheSize: distanceCache.size,
+                    indexStats: {
+                        timezones: timezoneIndex.size,
+                        genders: genderIndex.size,
+                        freshUsers: freshUsersSet.size,
+                        lastRebuild: Date.now() - lastIndexRebuild
+                    }
+                },
+                performance: {
+                    requestCount,
+                    matchingStats,
+                    uptime: Date.now() - lastResetTime
                 },
                 timestamp: Date.now()
             });
         }
         
-        const waitingUsers = await getWaitingUsers();
-        const activeMatches = await getActiveMatches();
-        
         return createCorsResponse({ 
-            status: 'redis-cloud-signaling-ready',
+            status: 'original-memory-signaling-ready',
             runtime: 'edge',
-            storage: 'redis-cloud',
-            redis: process.env.REDIS_URL ? 'available' : 'missing',
+            storage: 'memory',
             stats: { 
                 waiting: waitingUsers.size, 
                 matches: activeMatches.size,
                 strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
                          waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
             },
-            message: 'Redis Cloud WebRTC signaling server ready',
+            message: 'Original memory-based WebRTC signaling server ready',
             timestamp: Date.now()
         });
     }
@@ -732,7 +819,7 @@ export default async function handler(req) {
     }
     
     try {
-        // FLEXIBLE JSON PARSING (Original logic)
+        // FLEXIBLE JSON PARSING
         let data;
         let requestBody = '';
         
@@ -777,7 +864,6 @@ export default async function handler(req) {
         if (!action) {
             return createCorsResponse({ 
                 error: 'action is required',
-                validActions: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect']
             }, 400);
         }
         
@@ -785,15 +871,15 @@ export default async function handler(req) {
         
         switch (action) {
             case 'instant-match': 
-                return await handleInstantMatch(userId, data);
+                return handleInstantMatch(userId, data);
             case 'get-signals': 
-                return await handleGetSignals(userId, data);
+                return handleGetSignals(userId, data);
             case 'send-signal': 
-                return await handleSendSignal(userId, data);                
+                return handleSendSignal(userId, data);                
             case 'p2p-connected': 
-                return await handleP2pConnected(userId, data);      
+                return handleP2pConnected(userId, data);      
             case 'disconnect': 
-                return await handleDisconnect(userId);
+                return handleDisconnect(userId);
             default: 
                 return createCorsResponse({ error: `Unknown action: ${action}` }, 400);
         }
@@ -807,4 +893,4 @@ export default async function handler(req) {
     }
 }
 
-export const config = { runtime: 'nodejs18.x' };
+export const config = { runtime: 'edge' };
