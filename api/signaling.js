@@ -806,13 +806,14 @@ export default async function handler(req) {
     }
     
     try {
-        // FLEXIBLE JSON PARSING
+        // FLEXIBLE JSON PARSING - Support both application/json and text/plain
         let data;
         let requestBody = '';
         
         try {
             data = await req.json();
         } catch (jsonError) {
+            // Fallback to manual parsing for text/plain requests
             if (!req.body) {
                 return createCorsResponse({ 
                     error: 'No request body found',
@@ -836,7 +837,16 @@ export default async function handler(req) {
                 }, 400);
             }
             
-            data = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
+            // Parse as JSON string (handles text/plain content-type)
+            try {
+                data = JSON.parse(requestBody);
+            } catch (parseError) {
+                return createCorsResponse({ 
+                    error: 'Invalid JSON format',
+                    received: requestBody.substring(0, 100),
+                    tip: 'Ensure your data is valid JSON'
+                }, 400);
+            }
         }
         
         const { action, userId, chatZone } = data;
