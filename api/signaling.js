@@ -470,15 +470,18 @@ function handleInstantMatch(userId, data) {
     
     smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
     
-    // Remove from existing states using optimized removal
-    removeWaitingUser(userId);
-    
-    // Remove from active matches
+    // Remove from active matches first
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             activeMatches.delete(matchId);
             break;
         }
+    }
+    
+    // Temporarily remove from waiting list to avoid self-matching
+    const existingWaitingUser = waitingUsers.get(userId);
+    if (existingWaitingUser) {
+        removeWaitingUser(userId);
     }
     
     // 🔧 ADAPTIVE MATCHING STRATEGY
