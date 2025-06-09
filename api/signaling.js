@@ -850,13 +850,13 @@ export default async function handler(req) {
     }
     
     try {
-        // Simplified JSON parsing (chỉ xử lý text/plain)
+        // Read text/plain body and convert to JSON
         let requestBody = '';
         
         if (!req.body) {
             return createCorsResponse({ 
                 error: 'No request body found',
-                tip: 'Send JSON body with your POST request'
+                tip: 'Send text/plain body with your POST request'
             }, 400);
         }
         
@@ -871,3 +871,58 @@ export default async function handler(req) {
         
         if (!requestBody.trim()) {
             return createCorsResponse({
+                error: 'Empty request body',
+                expected: 'text/plain body containing JSON string'
+            }, 400);
+        }
+
+        // Convert text/plain to JSON
+        let data;
+        try {
+            data = JSON.parse(requestBody);
+        } catch (parseError) {
+            return createCorsResponse({
+                error: 'Invalid JSON in text/plain body',
+                received: requestBody.slice(0, 100),
+                parseError: parseError.message
+            }, 400);
+        }
+
+        const { action, userId } = data;
+
+        if (!action || !userId) {
+            return createCorsResponse({
+                error: 'Missing required fields',
+                required: ['action', 'userId'],
+                received: Object.keys(data)
+            }, 400);
+        }
+
+        // Handle different actions
+        switch (action) {
+            case 'instant-match':
+                return handleInstantMatch(userId, data);
+            case 'get-signals':
+                return handleGetSignals(userId, data);
+            case 'send-signal':
+                return handleSendSignal(userId, data);
+            case 'p2p-connected':
+                return handleP2pConnected(userId, data);
+            case 'disconnect':
+                return handleDisconnect(userId);
+            default:
+                return createCorsResponse({
+                    error: 'Unknown action',
+                    received: action,
+                    available: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect']
+                }, 400);
+        }
+
+    } catch (error) {
+        criticalLog('ERROR', `Server error: ${error.message}`);
+        return createCorsResponse({
+            error: 'Internal server error',
+            message: 'Please try again later'
+        }, 500);
+    }
+}
