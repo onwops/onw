@@ -1,8 +1,7 @@
 {
   "functions": {
-    "api/*.js": {
+    "api/**/*.js": {
 	   "maxDuration": 60,
-	    "runtime": "edge",
            "memory": 512
 
     }
