@@ -2,7 +2,7 @@
   "functions": {
     "api/*.js": {
 	   "maxDuration": 60,
-	    "runtime": "edge",
+	    "runtime": "nodejs18.x",
            "memory": 512
 
     }
