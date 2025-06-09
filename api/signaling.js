@@ -1152,6 +1152,8 @@ export default async function handler(req) {
             data = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
         }
         
+   
+        
         const { action, userId, chatZone } = data;
         
         if (!userId) {
