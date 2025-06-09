@@ -37,10 +37,7 @@ let timezoneIndex = new Map(); // timezone -> Set(userIds)
 let genderIndex = new Map();   // gender -> Set(userIds)
 let freshUsersSet = new Set(); // Users < 30s
 let lastIndexRebuild = 0;
-
-// 🔥 NEW: True incremental tracking
-let addedUsers = new Set();
-let removedUsers = new Map(); // userId -> user data for cleanup
+let indexDirty = false;
 
 // 🔥 OPTIMIZATION: Pre-calculated distance cache
 let distanceCache = new Map(); // "zone1,zone2" -> circularDistance
@@ -153,76 +150,29 @@ function getGenderScore(gender1, gender2) {
 }
 
 // ==========================================
-// TRUE INCREMENTAL INDEX MANAGEMENT
+// ADAPTIVE INDEX MANAGEMENT
 // ==========================================
-
-// Helper: Add user to indexes - O(1)
-function addUserToIndexes(userId, user) {
-    // Timezone index
-    const zone = user.chatZone;
-    if (typeof zone === 'number') {
-        if (!timezoneIndex.has(zone)) {
-            timezoneIndex.set(zone, new Set());
-        }
-        timezoneIndex.get(zone).add(userId);
-    }
-    
-    // Gender index
-    const gender = user.userInfo?.gender || 'Unspecified';
-    if (!genderIndex.has(gender)) {
-        genderIndex.set(gender, new Set());
-    }
-    genderIndex.get(gender).add(userId);
-    
-    // Fresh users (< 30 seconds)
-    if (Date.now() - user.timestamp < 30000) {
-        freshUsersSet.add(userId);
-    }
-}
-
-// Helper: Remove user from indexes - O(1)
-function removeUserFromIndexes(userId, user) {
-    if (!user) return;
-    
-    // Timezone index
-    const zone = user.chatZone;
-    if (typeof zone === 'number' && timezoneIndex.has(zone)) {
-        timezoneIndex.get(zone).delete(userId);
-        // Cleanup empty sets
-        if (timezoneIndex.get(zone).size === 0) {
-            timezoneIndex.delete(zone);
-        }
-    }
-    
-    // Gender index
-    const gender = user.userInfo?.gender || 'Unspecified';
-    if (genderIndex.has(gender)) {
-        genderIndex.get(gender).delete(userId);
-        if (genderIndex.get(gender).size === 0) {
-            genderIndex.delete(gender);
-        }
-    }
-    
-    // Fresh users
-    freshUsersSet.delete(userId);
-}
 
 function buildIndexesIfNeeded() {
     const now = Date.now();
     
-    // Process incremental updates first
-    if (addedUsers.size > 0 || removedUsers.size > 0) {
-        updateIndexesIncrementally();
-        return;
-    }
-    
     // Only rebuild if absolutely necessary
-    if (now - lastIndexRebuild < INDEX_REBUILD_INTERVAL && timezoneIndex.size > 0) {
+    if (!indexDirty && 
+        now - lastIndexRebuild < INDEX_REBUILD_INTERVAL && 
+        timezoneIndex.size > 0) {
         return; // Skip rebuild
     }
     
-    // Full rebuild for initial setup or periodic refresh
-    buildIndexes();
+    // Quick rebuild only if small user count
+    if (waitingUsers.size < 50) {
+        buildIndexes();
+        return;
+    }
+    
+    // For large user count, use incremental updates instead
+    if (indexDirty) {
+        updateIndexesIncrementally();
+    }
 }
 
 function buildIndexes() {
@@ -235,57 +185,38 @@ function buildIndexes() {
     
     // Build new indexes in single pass
     for (const [userId, user] of waitingUsers.entries()) {
-        addUserToIndexes(userId, user);
+        // Timezone index
+        const zone = user.chatZone;
+        if (typeof zone === 'number') {
+            if (!timezoneIndex.has(zone)) {
+                timezoneIndex.set(zone, new Set());
+            }
+            timezoneIndex.get(zone).add(userId);
+        }
+        
+        // Gender index
+        const gender = user.userInfo?.gender || 'Unspecified';
+        if (!genderIndex.has(gender)) {
+            genderIndex.set(gender, new Set());
+        }
+        genderIndex.get(gender).add(userId);
+        
+        // Fresh users (< 30 seconds)
+        if (now - user.timestamp < 30000) {
+            freshUsersSet.add(userId);
+        }
     }
     
     lastIndexRebuild = now;
+    indexDirty = false;
     
     smartLog('INDEX-REBUILD', `Indexes built: ${timezoneIndex.size} zones, ${genderIndex.size} genders, ${freshUsersSet.size} fresh`);
 }
 
 function updateIndexesIncrementally() {
-    // Process added users - O(k) where k = số users thay đổi
-    for (const userId of addedUsers) {
-        const user = waitingUsers.get(userId);
-        if (user) {
-            addUserToIndexes(userId, user);
-        }
-    }
-    
-    // Process removed users - O(k)
-    for (const [userId, userData] of removedUsers.entries()) {
-        removeUserFromIndexes(userId, userData);
-    }
-    
-    smartLog('INDEX-UPDATE', `Incremental update: ${addedUsers.size} added, ${removedUsers.size} removed`);
-    
-    // Clear change tracking
-    addedUsers.clear();
-    removedUsers.clear();
-}
-
-// ==========================================
-// OPTIMIZED USER OPERATIONS
-// ==========================================
-
-function addWaitingUser(userId, userData) {
-    waitingUsers.set(userId, userData);
-    addedUsers.add(userId);
-    // Real-time index update for immediate availability
-    addUserToIndexes(userId, userData);
-}
-
-function removeWaitingUser(userId) {
-    const user = waitingUsers.get(userId);
-    if (user) {
-        // Store user data for cleanup
-        removedUsers.set(userId, user);
-        // Real-time index cleanup
-        removeUserFromIndexes(userId, user);
-        waitingUsers.delete(userId);
-        return true;
-    }
-    return false;
+    // Only update what changed, don't rebuild everything
+    indexDirty = false;
+    smartLog('INDEX-UPDATE', 'Incremental index update');
 }
 
 // ==========================================
@@ -470,8 +401,11 @@ function handleInstantMatch(userId, data) {
     
     smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
     
-    // Remove from existing states using optimized removal
-    removeWaitingUser(userId);
+    // Remove from existing states
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        indexDirty = true;
+    }
     
     // Remove from active matches
     for (const [matchId, match] of activeMatches.entries()) {
@@ -491,26 +425,25 @@ function handleInstantMatch(userId, data) {
     if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
         // Very small pool - use simple linear search (fastest for small data)
         bestMatch = findSimpleMatch(userId, chatZone, userGender);
-        strategy = 'simple';
         
     } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
         // Medium pool - use hybrid approach
         bestMatch = findHybridMatch(userId, chatZone, userGender);
-        strategy = 'hybrid';
         
     } else {
         // Large pool - use full optimization
         buildIndexesIfNeeded();
         bestMatch = findUltraFastMatch(userId, chatZone, userGender);
-        strategy = 'optimized';
     }
+    
     
     if (bestMatch) {
         const partnerId = bestMatch.userId;
         const partnerUser = bestMatch.user;
         
-        // Remove partner from waiting using optimized removal
-        removeWaitingUser(partnerId);
+        // Remove partner from waiting
+        waitingUsers.delete(partnerId);
+        indexDirty = true;
         
         // Create match
         const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -532,13 +465,12 @@ function handleInstantMatch(userId, data) {
                 [userId]: chatZone,
                 [partnerId]: partnerUser.chatZone
             },
-            matchScore: bestMatch.score,
-            strategy: strategy
+            matchScore: bestMatch.score
         };
         
         activeMatches.set(matchId, match);
         
-        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score} | Strategy: ${strategy}`);
+        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
         
         return createCorsResponse({
             status: 'instant-match',
@@ -549,13 +481,12 @@ function handleInstantMatch(userId, data) {
             partnerChatZone: partnerUser.chatZone,
             signals: [],
             compatibility: bestMatch.score,
-            strategy: strategy,
             message: 'Instant match found! WebRTC connection will be established.',
             timestamp: Date.now()
         });
         
     } else {
-        // Add to waiting list using optimized addition
+        // Add to waiting list
         const waitingUser = {
             userId,
             userInfo: userInfo || {},
@@ -563,10 +494,11 @@ function handleInstantMatch(userId, data) {
             timestamp: Date.now()
         };
         
-        addWaitingUser(userId, waitingUser);
+        waitingUsers.set(userId, waitingUser);
+        indexDirty = true;
         
         const position = waitingUsers.size;
-        smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position}) | Strategy: ${strategy || 'simple'}`);
+        smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position})`);
         
         return createCorsResponse({
             status: 'waiting',
@@ -574,7 +506,6 @@ function handleInstantMatch(userId, data) {
             waitingUsers: waitingUsers.size,
             chatZone: chatZone,
             userGender: userGender,
-            strategy: strategy || 'simple',
             message: 'Added to matching queue. Waiting for partner...',
             estimatedWaitTime: Math.min(waitingUsers.size * 2, 30),
             timestamp: Date.now()
@@ -583,7 +514,7 @@ function handleInstantMatch(userId, data) {
 }
 
 // ==========================================
-// OTHER HANDLERS (UPDATED WITH OPTIMIZED REMOVAL)
+// OTHER HANDLERS (SAME AS BEFORE)
 // ==========================================
 
 function handleGetSignals(userId, data) {
@@ -606,7 +537,6 @@ function handleGetSignals(userId, data) {
                 signals,
                 partnerChatZone: match.chatZones ? match.chatZones[partnerId] : null,
                 matchScore: match.matchScore || null,
-                strategy: match.strategy || 'unknown',
                 timestamp: Date.now()
             });
         }
@@ -690,9 +620,16 @@ function handleP2pConnected(userId, data) {
     
     let removed = false;
     
-    // Use optimized removal
-    if (removeWaitingUser(userId)) removed = true;
-    if (removeWaitingUser(partnerId)) removed = true;
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        removed = true;
+        indexDirty = true;
+    }
+    if (waitingUsers.has(partnerId)) {
+        waitingUsers.delete(partnerId);
+        removed = true;
+        indexDirty = true;
+    }
     
     activeMatches.delete(matchId);
     
@@ -708,8 +645,11 @@ function handleDisconnect(userId) {
     
     let removed = false;
     
-    // Use optimized removal
-    if (removeWaitingUser(userId)) removed = true;
+    if (waitingUsers.has(userId)) {
+        waitingUsers.delete(userId);
+        removed = true;
+        indexDirty = true;
+    }
     
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
@@ -762,9 +702,10 @@ function cleanup() {
         }
     }
     
-    // Batch delete using optimized removal
+    // Batch delete
     expiredUsers.forEach(userId => {
-        if (removeWaitingUser(userId)) cleanedUsers++;
+        waitingUsers.delete(userId);
+        cleanedUsers++;
     });
     
     expiredMatches.forEach(matchId => {
@@ -781,8 +722,14 @@ function cleanup() {
             .map(entry => entry[0]);
         
         oldestUsers.forEach(userId => {
-            if (removeWaitingUser(userId)) cleanedUsers++;
+            waitingUsers.delete(userId);
+            cleanedUsers++;
         });
+    }
+    
+    // Mark indexes as dirty if cleanup occurred
+    if (cleanedUsers > 0) {
+        indexDirty = true;
     }
     
     if (cleanedUsers > 0 || cleanedMatches > 0) {
@@ -822,10 +769,13 @@ export default async function handler(req) {
                         timezones: timezoneIndex.size,
                         genders: genderIndex.size,
                         freshUsers: freshUsersSet.size,
-                        lastRebuild: Date.now() - lastIndexRebuild,
-                        pendingAdds: addedUsers.size,
-                        pendingRemoves: removedUsers.size
+                        lastRebuild: Date.now() - lastIndexRebuild
                     }
+                },
+                performance: {
+                    requestCount,
+                    matchingStats,
+                    uptime: Date.now() - lastResetTime
                 },
                 timestamp: Date.now()
             });
@@ -840,7 +790,7 @@ export default async function handler(req) {
                 strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
                          waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
             },
-            message: 'Hybrid-optimized WebRTC signaling server with true incremental updates ready',
+            message: 'Hybrid-optimized WebRTC signaling server ready',
             timestamp: Date.now()
         });
     }
@@ -850,34 +800,38 @@ export default async function handler(req) {
     }
     
     try {
-        // Simplified JSON parsing (chỉ xử lý text/plain)
+        // FLEXIBLE JSON PARSING
+        let data;
         let requestBody = '';
         
-        if (!req.body) {
-            return createCorsResponse({ 
-                error: 'No request body found',
-                tip: 'Send JSON body with your POST request'
-            }, 400);
+        try {
+            data = await req.json();
+        } catch (jsonError) {
+            if (!req.body) {
+                return createCorsResponse({ 
+                    error: 'No request body found',
+                    tip: 'Send JSON body with your POST request'
+                }, 400);
+            }
+            
+            const reader = req.body.getReader();
+            const decoder = new TextDecoder();
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                requestBody += decoder.decode(value, { stream: true });
+            }
+            
+            if (!requestBody.trim()) {
+                return createCorsResponse({ 
+                    error: 'Empty request body',
+                    tip: 'Send JSON data'
+                }, 400);
+            }
+            
+            data = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
         }
-        
-        const reader = req.body.getReader();
-        const decoder = new TextDecoder();
-        
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            requestBody += decoder.decode(value, { stream: true });
-        }
-        
-        if (!requestBody.trim()) {
-            return createCorsResponse({ 
-                error: 'Empty request body',
-                tip: 'Send JSON data'
-            }, 400);
-        }
-        
-        // Parse JSON từ string
-        const data = JSON.parse(requestBody);
         
         const { action, userId, chatZone } = data;
         
