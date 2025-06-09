@@ -1,4 +1,4 @@
-// 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server
+// 🚀 IMPROVED WebRTC Signaling Server - Fixed Architecture
 
 const ENABLE_DETAILED_LOGGING = false;
 
@@ -18,12 +18,7 @@ const TIMEZONE_CIRCLE_HOURS = 24;
 // Performance constants
 const INDEX_REBUILD_INTERVAL = 10000; // 10 seconds
 const MAX_CACHE_SIZE = 1000;
-const MATCH_CACHE_TTL = 5000; // 5 seconds
-const MAX_CANDIDATES = 5; // Reduced from 10
-
-// Adaptive strategy thresholds
-const SIMPLE_STRATEGY_THRESHOLD = 10;
-const HYBRID_STRATEGY_THRESHOLD = 100;
+const ADAPTIVE_THRESHOLD = 50; // Switch to indexed matching
 
 // ==========================================
 // OPTIMIZED GLOBAL STATE
@@ -36,22 +31,14 @@ let activeMatches = new Map();
 let timezoneIndex = new Map(); // timezone -> Set(userIds)
 let genderIndex = new Map();   // gender -> Set(userIds)
 let freshUsersSet = new Set(); // Users < 30s
-let lastIndexRebuild = 0;
-let indexDirty = false;
 
 // 🔥 OPTIMIZATION: Pre-calculated distance cache
 let distanceCache = new Map(); // "zone1,zone2" -> circularDistance
 let timezoneScoreTable = new Array(25); // Pre-calculated scores 0-24
 let genderScoreTable = new Map(); // Pre-calculated gender combinations
 
-// 🔥 OPTIMIZATION: Object pools for memory optimization
-let matchObjectPool = [];
-let signalObjectPool = [];
-
-// ==========================================
-// PERFORMANCE MONITORING
-// ==========================================
-
+// 🔒 RACE CONDITION PROTECTION
+let matchingInProgress = new Set(); // Track users currently being matched
 
 // ==========================================
 // LOGGING UTILITIES
@@ -150,81 +137,78 @@ function getGenderScore(gender1, gender2) {
 }
 
 // ==========================================
-// ADAPTIVE INDEX MANAGEMENT
+// IMPROVED INDEX MANAGEMENT - Real-time Updates
 // ==========================================
 
-function buildIndexesIfNeeded() {
+function addUserToIndexes(userId, user) {
+    // Timezone index
+    if (typeof user.chatZone === 'number') {
+        if (!timezoneIndex.has(user.chatZone)) {
+            timezoneIndex.set(user.chatZone, new Set());
+        }
+        timezoneIndex.get(user.chatZone).add(userId);
+    }
+    
+    // Gender index
+    const gender = user.userInfo?.gender || 'Unspecified';
+    if (!genderIndex.has(gender)) {
+        genderIndex.set(gender, new Set());
+    }
+    genderIndex.get(gender).add(userId);
+    
+    // Fresh users (< 30 seconds)
     const now = Date.now();
-    
-    // Only rebuild if absolutely necessary
-    if (!indexDirty && 
-        now - lastIndexRebuild < INDEX_REBUILD_INTERVAL && 
-        timezoneIndex.size > 0) {
-        return; // Skip rebuild
-    }
-    
-    // Quick rebuild only if small user count
-    if (waitingUsers.size < 50) {
-        buildIndexes();
-        return;
-    }
-    
-    // For large user count, use incremental updates instead
-    if (indexDirty) {
-        updateIndexesIncrementally();
+    if (now - user.timestamp < 30000) {
+        freshUsersSet.add(userId);
     }
 }
 
-function buildIndexes() {
-    const now = Date.now();
-    
-    // Clear indexes
-    timezoneIndex.clear();
-    genderIndex.clear();
-    freshUsersSet.clear();
-    
-    // Build new indexes in single pass
-    for (const [userId, user] of waitingUsers.entries()) {
-        // Timezone index
-        const zone = user.chatZone;
-        if (typeof zone === 'number') {
-            if (!timezoneIndex.has(zone)) {
-                timezoneIndex.set(zone, new Set());
+function removeUserFromIndexes(userId, user) {
+    // Remove from timezone index
+    if (typeof user.chatZone === 'number') {
+        const zoneSet = timezoneIndex.get(user.chatZone);
+        if (zoneSet) {
+            zoneSet.delete(userId);
+            if (zoneSet.size === 0) {
+                timezoneIndex.delete(user.chatZone);
             }
-            timezoneIndex.get(zone).add(userId);
-        }
-        
-        // Gender index
-        const gender = user.userInfo?.gender || 'Unspecified';
-        if (!genderIndex.has(gender)) {
-            genderIndex.set(gender, new Set());
-        }
-        genderIndex.get(gender).add(userId);
-        
-        // Fresh users (< 30 seconds)
-        if (now - user.timestamp < 30000) {
-            freshUsersSet.add(userId);
         }
     }
     
-    lastIndexRebuild = now;
-    indexDirty = false;
+    // Remove from gender index
+    const gender = user.userInfo?.gender || 'Unspecified';
+    const genderSet = genderIndex.get(gender);
+    if (genderSet) {
+        genderSet.delete(userId);
+        if (genderSet.size === 0) {
+            genderIndex.delete(gender);
+        }
+    }
     
-    smartLog('INDEX-REBUILD', `Indexes built: ${timezoneIndex.size} zones, ${genderIndex.size} genders, ${freshUsersSet.size} fresh`);
+    // Remove from fresh set
+    freshUsersSet.delete(userId);
 }
 
-function updateIndexesIncrementally() {
-    // Only update what changed, don't rebuild everything
-    indexDirty = false;
-    smartLog('INDEX-UPDATE', 'Incremental index update');
+function addWaitingUser(userId, userData) {
+    waitingUsers.set(userId, userData);
+    addUserToIndexes(userId, userData);
+}
+
+function removeWaitingUser(userId) {
+    const userData = waitingUsers.get(userId);
+    if (userData) {
+        waitingUsers.delete(userId);
+        removeUserFromIndexes(userId, userData);
+        return userData;
+    }
+    return null;
 }
 
 // ==========================================
-// MATCHING STRATEGIES
+// SIMPLIFIED MATCHING STRATEGIES
 // ==========================================
 
-function findSimpleMatch(userId, userChatZone, userGender) {
-    // Simple approach like old version - guaranteed fast for small datasets
+function findWithLinearScan(userId, userChatZone, userGender) {
     let bestMatch = null;
     let bestScore = 0;
     
@@ -260,9 +244,7 @@ function findSimpleMatch(userId, userChatZone, userGender) {
     return bestMatch;
 }
 
-function findUltraFastMatch(userId, userChatZone, userGender) {
-    buildIndexesIfNeeded();
-    
+function findWithIndexes(userId, userChatZone, userGender) {
     const now = Date.now();
     let bestMatch = null;
     let bestScore = 0;
@@ -368,46 +350,37 @@ function findUltraFastMatch(userId, userChatZone, userGender) {
     return bestMatch;
 }
 
-function findHybridMatch(userId, userChatZone, userGender) {
-    // If small user count, use simple approach (like old version)
-    if (waitingUsers.size <= 20) {
-        return findSimpleMatch(userId, userChatZone, userGender);
+// ==========================================
+// UNIFIED MATCHING FUNCTION
+// ==========================================
+
+function findBestMatch(userId, userChatZone, userGender) {
+    try {
+        // Use indexes for larger user pools
+        if (waitingUsers.size > ADAPTIVE_THRESHOLD) {
+            return findWithIndexes(userId, userChatZone, userGender);
+        }
+    } catch (indexError) {
+        // Graceful degradation if indexes fail
+        smartLog('FALLBACK', 'Index matching failed, using linear scan');
     }
     
-    // If many null/undefined timezones, use simple approach
-    const validTimezoneUsers = Array.from(waitingUsers.values())
-        .filter(u => typeof u.chatZone === 'number').length;
-    
-    if (validTimezoneUsers < waitingUsers.size * 0.5) {
-        return findSimpleMatch(userId, userChatZone, userGender);
-    }
-    
-    // Otherwise use optimized approach
-    buildIndexesIfNeeded();
-    return findUltraFastMatch(userId, userChatZone, userGender);
+    // Always have fallback to linear scan
+    return findWithLinearScan(userId, userChatZone, userGender);
 }
 
 // ==========================================
-// ADAPTIVE INSTANT MATCH HANDLER
+// RACE-CONDITION SAFE MATCHING
 // ==========================================
 
-function handleInstantMatch(userId, data) {
+function performMatching(userId, data) {
     const { userInfo, preferredMatchId, chatZone, gender } = data;
+    const userGender = gender || userInfo?.gender || 'Unspecified';
     
-    // MINIMAL VALIDATION - NO chatZone validation to avoid 400 error
-    if (!userId || typeof userId !== 'string') {
-        return createCorsResponse({ error: 'userId is required and must be string' }, 400);
-    }
+    // Double-check and cleanup user from waiting state
+    removeWaitingUser(userId);
     
-    smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
-    
-    // Remove from existing states
-    if (waitingUsers.has(userId)) {
-        waitingUsers.delete(userId);
-        indexDirty = true;
-    }
-    
-    // Remove from active matches
+    // Remove from active matches if exists
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             activeMatches.delete(matchId);
@@ -415,35 +388,29 @@ function handleInstantMatch(userId, data) {
         }
     }
     
-    // 🔧 ADAPTIVE MATCHING STRATEGY
-    const userGender = gender || userInfo?.gender || 'Unspecified';
-    const startTime = Date.now();
-    
-    let bestMatch;
-    let strategy;
-    
-    if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
-        // Very small pool - use simple linear search (fastest for small data)
-        bestMatch = findSimpleMatch(userId, chatZone, userGender);
-        
-    } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
-        // Medium pool - use hybrid approach
-        bestMatch = findHybridMatch(userId, chatZone, userGender);
-        
-    } else {
-        // Large pool - use full optimization
-        buildIndexesIfNeeded();
-        bestMatch = findUltraFastMatch(userId, chatZone, userGender);
-    }
-    
+    // Find best match
+    const bestMatch = findBestMatch(userId, chatZone, userGender);
     
     if (bestMatch) {
         const partnerId = bestMatch.userId;
         const partnerUser = bestMatch.user;
         
-        // Remove partner from waiting
-        waitingUsers.delete(partnerId);
-        indexDirty = true;
+        // Atomic partner removal with validation
+        const removedPartner = removeWaitingUser(partnerId);
+        if (!removedPartner) {
+            // Partner was already matched by another request
+            // Restore current user to waiting list
+            const waitingUser = {
+                userId,
+                userInfo: userInfo || {},
+                chatZone: chatZone || null,
+                timestamp: Date.now()
+            };
+            addWaitingUser(userId, waitingUser);
+            
+            smartLog('RACE-AVOIDED', `${userId.slice(-8)} - partner ${partnerId.slice(-8)} already taken`);
+            return { retry: true };
+        }
         
         // Create match
         const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -452,7 +419,6 @@ function handleInstantMatch(userId, data) {
         const p1 = isUserInitiator ? userId : partnerId;
         const p2 = isUserInitiator ? partnerId : userId;
         
-        // Use simple object creation for reliability
         const match = {
             p1, p2,
             timestamp: Date.now(),
@@ -470,20 +436,23 @@ function handleInstantMatch(userId, data) {
         
         activeMatches.set(matchId, match);
         
-        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
+        criticalLog('MATCH-SUCCESS', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
         
-        return createCorsResponse({
-            status: 'instant-match',
-            matchId,
-            partnerId,
-            isInitiator: isUserInitiator,
-            partnerInfo: partnerUser.userInfo || {},
-            partnerChatZone: partnerUser.chatZone,
-            signals: [],
-            compatibility: bestMatch.score,
-            message: 'Instant match found! WebRTC connection will be established.',
-            timestamp: Date.now()
-        });
+        return {
+            success: true,
+            response: createCorsResponse({
+                status: 'instant-match',
+                matchId,
+                partnerId,
+                isInitiator: isUserInitiator,
+                partnerInfo: partnerUser.userInfo || {},
+                partnerChatZone: partnerUser.chatZone,
+                signals: [],
+                compatibility: bestMatch.score,
+                message: 'Instant match found! WebRTC connection will be established.',
+                timestamp: Date.now()
+            })
+        };
         
     } else {
         // Add to waiting list
@@ -494,22 +463,62 @@ function handleInstantMatch(userId, data) {
             timestamp: Date.now()
         };
         
-        waitingUsers.set(userId, waitingUser);
-        indexDirty = true;
+        addWaitingUser(userId, waitingUser);
         
         const position = waitingUsers.size;
-        smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list (position ${position})`);
+        smartLog('WAIT-ADDED', `${userId.slice(-8)} added to waiting list (position ${position})`);
         
-        return createCorsResponse({
-            status: 'waiting',
-            position,
-            waitingUsers: waitingUsers.size,
-            chatZone: chatZone,
-            userGender: userGender,
-            message: 'Added to matching queue. Waiting for partner...',
-            estimatedWaitTime: Math.min(waitingUsers.size * 2, 30),
-            timestamp: Date.now()
+        return {
+            success: true,
+            response: createCorsResponse({
+                status: 'waiting',
+                position,
+                waitingUsers: waitingUsers.size,
+                chatZone: chatZone,
+                userGender: userGender,
+                message: 'Added to matching queue. Waiting for partner...',
+                estimatedWaitTime: Math.min(waitingUsers.size * 2, 30),
+                timestamp: Date.now()
+            })
+        };
+    }
+}
+
+function handleInstantMatch(userId, data) {
+    // MINIMAL VALIDATION
+    if (!userId || typeof userId !== 'string') {
+        return createCorsResponse({ error: 'userId is required and must be string' }, 400);
+    }
+    
+    // 🔒 RACE CONDITION PROTECTION
+    if (matchingInProgress.has(userId)) {
+        return createCorsResponse({ 
+            status: 'already_matching',
+            message: 'Match request already in progress' 
         });
+    }
+    
+    // Add to lock set
+    matchingInProgress.add(userId);
+    
+    try {
+        smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${data.chatZone})`);
+        
+        // Perform matching in critical section
+        const result = performMatching(userId, data);
+        
+        // Handle retry case (race condition detected)
+        if (result.retry) {
+            // Try again immediately
+            const retryResult = performMatching(userId, data);
+            return retryResult.response;
+        }
+        
+        return result.response;
+        
+    } finally {
+        // Always cleanup lock
+        matchingInProgress.delete(userId);
     }
 }
 
@@ -620,15 +629,12 @@ function handleP2pConnected(userId, data) {
     
     let removed = false;
     
-    if (waitingUsers.has(userId)) {
-        waitingUsers.delete(userId);
+    // Safe removal with validation
+    if (removeWaitingUser(userId)) {
         removed = true;
-        indexDirty = true;
     }
-    if (waitingUsers.has(partnerId)) {
-        waitingUsers.delete(partnerId);
+    if (removeWaitingUser(partnerId)) {
         removed = true;
-        indexDirty = true;
     }
     
     activeMatches.delete(matchId);
@@ -645,12 +651,12 @@ function handleDisconnect(userId) {
     
     let removed = false;
     
-    if (waitingUsers.has(userId)) {
-        waitingUsers.delete(userId);
+    // Safe removal from waiting list
+    if (removeWaitingUser(userId)) {
         removed = true;
-        indexDirty = true;
     }
     
+    // Remove from active matches
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             const partnerId = match.p1 === userId ? match.p2 : match.p1;
@@ -702,10 +708,11 @@ function cleanup() {
         }
     }
     
-    // Batch delete
+    // Batch delete with safe removal
     expiredUsers.forEach(userId => {
-        waitingUsers.delete(userId);
-        cleanedUsers++;
+        if (removeWaitingUser(userId)) {
+            cleanedUsers++;
+        }
     });
     
     expiredMatches.forEach(matchId => {
@@ -722,14 +729,18 @@ function cleanup() {
             .map(entry => entry[0]);
         
         oldestUsers.forEach(userId => {
-            waitingUsers.delete(userId);
-            cleanedUsers++;
+            if (removeWaitingUser(userId)) {
+                cleanedUsers++;
+            }
         });
     }
     
-    // Mark indexes as dirty if cleanup occurred
-    if (cleanedUsers > 0) {
-        indexDirty = true;
+    // Cleanup stale fresh users
+    for (const userId of freshUsersSet) {
+        const user = waitingUsers.get(userId);
+        if (!user || now - user.timestamp > 30000) {
+            freshUsersSet.delete(userId);
+        }
     }
     
     if (cleanedUsers > 0 || cleanedMatches > 0) {
@@ -754,43 +765,38 @@ export default async function handler(req) {
         
         if (debug === 'true') {
             return createCorsResponse({
-                status: 'hybrid-optimized-webrtc-signaling',
+                status: 'improved-webrtc-signaling',
                 runtime: 'edge',
-                strategies: {
-                    simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
-                    hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
-                    optimized: `>${HYBRID_STRATEGY_THRESHOLD} users`
-                },
+                improvements: [
+                    'Unified adaptive matching strategy',
+                    'Race condition protection with micro-locking',
+                    'Real-time index consistency',
+                    'Graceful fallback mechanisms'
+                ],
                 stats: {
                     waitingUsers: waitingUsers.size,
                     activeMatches: activeMatches.size,
+                    matchingInProgress: matchingInProgress.size,
                     cacheSize: distanceCache.size,
                     indexStats: {
                         timezones: timezoneIndex.size,
                         genders: genderIndex.size,
-                        freshUsers: freshUsersSet.size,
-                        lastRebuild: Date.now() - lastIndexRebuild
+                        freshUsers: freshUsersSet.size
                     }
-                },
-                performance: {
-                    requestCount,
-                    matchingStats,
-                    uptime: Date.now() - lastResetTime
                 },
                 timestamp: Date.now()
             });
         }
         
         return createCorsResponse({ 
-            status: 'hybrid-optimized-signaling-ready',
+            status: 'improved-signaling-ready',
             runtime: 'edge',
             stats: { 
                 waiting: waitingUsers.size, 
                 matches: activeMatches.size,
-                strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
-                         waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
+                strategy: waitingUsers.size <= ADAPTIVE_THRESHOLD ? 'linear' : 'indexed'
             },
-            message: 'Hybrid-optimized WebRTC signaling server ready',
+            message: 'Improved WebRTC signaling server ready',
             timestamp: Date.now()
         });
     }
@@ -874,6 +880,5 @@ export default async function handler(req) {
         }, 500);
     }
 }
-
 
 export const config = { runtime: 'edge' };
