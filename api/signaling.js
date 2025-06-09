@@ -1123,36 +1123,33 @@ export default async function handler(req) {
         let data;
         let requestBody = '';
         
-        try {
-            data = await req.json();
-        } catch (jsonError) {
-            if (!req.body) {
-                return createCorsResponse({ 
-                    error: 'No request body found',
-                    tip: 'Send JSON body with your POST request'
-                }, 400);
-            }
-            
-            const reader = req.body.getReader();
-            const decoder = new TextDecoder();
-            
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                requestBody += decoder.decode(value, { stream: true });
-            }
-            
-            if (!requestBody.trim()) {
-                return createCorsResponse({ 
-                    error: 'Empty request body',
-                    tip: 'Send JSON data'
-                }, 400);
-            }
-            
-            data = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
-        }
-        
-        const { action, userId, chatZone } = data;
+       if (!req.body) {
+        return createCorsResponse({ 
+            error: 'No request body found',
+            tip: 'Send JSON body with your POST request'
+        }, 400);
+    }
+    
+    const reader = req.body.getReader();
+    const decoder = new TextDecoder();
+    
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        requestBody += decoder.decode(value, { stream: true });
+    }
+    
+    if (!requestBody.trim()) {
+        return createCorsResponse({ 
+            error: 'Empty request body',
+            tip: 'Send JSON data'
+        }, 400);
+    }
+    
+    // Parse JSON từ string
+    const data = JSON.parse(requestBody);
+    
+    const { action, userId, chatZone } = data;
         
         if (!userId) {
             return createCorsResponse({ 
