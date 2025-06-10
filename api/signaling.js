@@ -159,7 +159,134 @@ async function removeWaitingUserFromRedis(userId) {
         return false;
     }
 }
-
+async function handleP2pConnected(userId, data) {
+    const { matchId, partnerId } = data;
+    
+    console.log(`[P2P-CONNECTED] ${userId.slice(-8)} connected to match ${matchId?.slice(-8)}`);
+    
+    try {
+        // Remove from waiting list if still there
+        let removed = false;
+        if (await removeWaitingUserFromRedis(userId)) removed = true;
+        if (partnerId && await removeWaitingUserFromRedis(partnerId)) removed = true;
+        
+        // Update match status
+        if (matchId) {
+            const match = await getMatch(matchId);
+            if (match) {
+                match.connected = true;
+                match.connectedAt = Date.now();
+                await setMatch(matchId, match);
+                
+                console.log(`[P2P-CONNECTED] ✅ Match ${matchId.slice(-8)} marked as connected`);
+                
+                return {
+                    statusCode: 200,
+                    body: JSON.stringify({
+                        status: 'p2p_connected',
+                        removed,
+                        matchPreserved: true,
+                        timestamp: Date.now()
+                    })
+                };
+            } else {
+                console.log(`[P2P-CONNECTED] ⚠️ Match ${matchId.slice(-8)} not found`);
+            }
+        }
+        
+        return {
+            statusCode: 200,
+            body: JSON.stringify({
+                status: 'p2p_connected',
+                removed,
+                matchPreserved: false,
+                message: 'Match not found but users removed from waiting list',
+                timestamp: Date.now()
+            })
+        };
+        
+    } catch (error) {
+        console.error(`[P2P-CONNECTED-ERROR] ${userId.slice(-8)}:`, error.message);
+        
+        return {
+            statusCode: 500,
+            body: JSON.stringify({
+                error: 'Failed to handle P2P connection',
+                message: error.message,
+                timestamp: Date.now()
+            })
+        };
+    }
+}
+async function handleDisconnect(userId) {
+    console.log(`[DISCONNECT] ${userId.slice(-8)} disconnecting`);
+    
+    try {
+        let removed = false;
+        
+        // Remove from waiting list
+        if (await removeWaitingUserFromRedis(userId)) {
+            removed = true;
+            console.log(`[DISCONNECT] ${userId.slice(-8)} removed from waiting list`);
+        }
+        
+        // Find and handle active matches
+        const redis = await getRedisClient();
+        const matchKeys = await redis.keys('match:*');
+        
+        for (const key of matchKeys) {
+            const matchId = key.replace('match:', '');
+            const match = await getMatch(matchId);
+            
+            if (match && (match.p1 === userId || match.p2 === userId)) {
+                const partnerId = match.p1 === userId ? match.p2 : match.p1;
+                
+                // Send disconnect signal to partner
+                if (match.signals && match.signals[partnerId]) {
+                    match.signals[partnerId].push({
+                        type: 'disconnect',
+                        payload: { reason: 'partner_disconnected' },
+                        from: userId,
+                        timestamp: Date.now()
+                    });
+                    
+                    await setMatch(matchId, match);
+                }
+                
+                // Schedule match deletion after delay
+                setTimeout(async () => {
+                    await deleteMatch(matchId);
+                    console.log(`[DISCONNECT] ⏰ Delayed removal of match ${matchId.slice(-8)}`);
+                }, 5000);
+                
+                console.log(`[DISCONNECT] 📤 Disconnect signal sent to ${partnerId.slice(-8)}, match ${matchId.slice(-8)} scheduled for removal`);
+                removed = true;
+                break;
+            }
+        }
+        
+        return {
+            statusCode: 200,
+            body: JSON.stringify({
+                status: 'disconnected',
+                removed,
+                timestamp: Date.now()
+            })
+        };
+        
+    } catch (error) {
+        console.error(`[DISCONNECT-ERROR] ${userId.slice(-8)}:`, error.message);
+        
+        return {
+            statusCode: 500,
+            body: JSON.stringify({
+                error: 'Failed to handle disconnect',
+                message: error.message,
+                timestamp: Date.now()
+            })
+        };
+    }
+}
 async function getAllWaitingUsersFromRedis() {
     try {
         const redis = await getRedisClient();
