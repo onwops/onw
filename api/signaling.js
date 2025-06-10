@@ -563,7 +563,15 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
 }
 async function handleSendSignal(userId, data) {
     const { matchId, type, payload } = data;
+   console.log(`📤 [SIGNAL] ${userId.slice(-8)} sending ${type} to match ${matchId?.slice(-8)}`);
     
+    // ✅ Special logging for offer/answer
+    if (type === 'offer' || type === 'answer') {
+        console.log(`📤 [${type.toUpperCase()}] Received from ${userId.slice(-8)}`);
+        console.log(`📤 [${type.toUpperCase()}] SDP size: ${payload?.sdp?.length || 0} chars`);
+        console.log(`📤 [${type.toUpperCase()}] SDP preview: ${payload?.sdp?.substring(0, 100)}...`);
+        console.log(`📤 [${type.toUpperCase()}] Payload keys: ${Object.keys(payload || {})}`);
+    }
     // ✅ SỬA: Enhanced validation
     if (!matchId || !type || !payload) {
         return {
