@@ -56,7 +56,7 @@ async function getRedisClient() {
     if (!redisClient) {
         redisClient = createClient({
             // ✅ FIX: Proper Redis Labs URL format for Node.js
-            url: "rediss://default:SXZanOZvHCZurRd8dTCudyIKvciwuNz0@redis-12481.c294.ap-northeast-1-2.ec2.redns.redis-cloud.com:12481",
+            url: "redis://default:SXZanOZvHCZurRd8dTCudyIKvciwuNz0@redis-12481.c294.ap-northeast-1-2.ec2.redns.redis-cloud.com:12481",
             socket: {
                 // ✅ FIX: Correct TLS config for Redis Labs
                 tls: true,
