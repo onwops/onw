@@ -1,9 +1,151 @@
-// 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - VERCEL EDGE FIXED
+// 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - REDIS INTEGRATED
 
 // ✅ CRITICAL: Vercel Edge Runtime configuration
 export const config = {runtime: 'edge'}
 
 const ENABLE_DETAILED_LOGGING = false;
+
+// ==========================================
+// REDIS CONFIGURATION & CONNECTION
+// ==========================================
+
+let redisClient = null;
+
+async function getRedisClient() {
+    if (!redisClient) {
+        const { createClient } = await import('redis');
+        
+        redisClient = createClient({
+            url: "redis://default:SXZanOZvHCZurRd8dTCudyIKvciwuNz0@redis-12481.c294.ap-northeast-1-2.ec2.redns.redis-cloud.com:12481",
+            socket: {
+                tls: true,
+                rejectUnauthorized: false
+            },
+            // Connection pool settings for Edge Runtime
+            connect_timeout: 5000,
+            command_timeout: 3000
+        });
+        
+        redisClient.on('error', (err) => {
+            criticalLog('REDIS-ERROR', 'Redis Client Error:', err);
+        });
+        
+        await redisClient.connect();
+        criticalLog('REDIS', 'Connected to Redis successfully');
+    }
+    return redisClient;
+}
+
+// ==========================================
+// REDIS HELPER FUNCTIONS
+// ==========================================
+
+async function setMatch(matchId, match) {
+    try {
+        const redis = await getRedisClient();
+        await redis.setex(`match:${matchId}`, 600, JSON.stringify(match)); // 10 minutes TTL
+        smartLog('REDIS', `Match ${matchId} saved to Redis`);
+    } catch (error) {
+        criticalLog('REDIS-ERROR', `Failed to save match ${matchId}:`, error);
+        throw error;
+    }
+}
+
+async function getMatch(matchId) {
+    try {
+        const redis = await getRedisClient();
+        const data = await redis.get(`match:${matchId}`);
+        if (data) {
+            smartLog('REDIS', `Match ${matchId} retrieved from Redis`);
+            return JSON.parse(data);
+        }
+        return null;
+    } catch (error) {
+        criticalLog('REDIS-ERROR', `Failed to get match ${matchId}:`, error);
+        return null;
+    }
+}
+
+async function deleteMatch(matchId) {
+    try {
+        const redis = await getRedisClient();
+        await redis.del(`match:${matchId}`);
+        smartLog('REDIS', `Match ${matchId} deleted from Redis`);
+    } catch (error) {
+        criticalLog('REDIS-ERROR', `Failed to delete match ${matchId}:`, error);
+    }
+}
+
+async function addWaitingUserToRedis(userId, userData) {
+    try {
+        const redis = await getRedisClient();
+        await redis.hset('waiting_users', userId, JSON.stringify(userData));
+        await redis.expire('waiting_users', 300); // 5 minutes TTL for waiting users
+        smartLog('REDIS', `User ${userId.slice(-8)} added to Redis waiting list`);
+    } catch (error) {
+        criticalLog('REDIS-ERROR', `Failed to add user ${userId} to Redis:`, error);
+    }
+}
+
+async function removeWaitingUserFromRedis(userId) {
+    try {
+        const redis = await getRedisClient();
+        const removed = await redis.hdel('waiting_users', userId);
+        smartLog('REDIS', `User ${userId.slice(-8)} removed from Redis waiting list`);
+        return removed > 0;
+    } catch (error) {
+        criticalLog('REDIS-ERROR', `Failed to remove user ${userId} from Redis:`, error);
+        return false;
+    }
+}
+
+async function getAllWaitingUsersFromRedis() {
+    try {
+        const redis = await getRedisClient();
+        const users = await redis.hgetall('waiting_users');
+        const parsedUsers = new Map();
+        
+        for (const [userId, userData] of Object.entries(users)) {
+            try {
+                parsedUsers.set(userId, JSON.parse(userData));
+            } catch (parseError) {
+                criticalLog('REDIS-ERROR', `Failed to parse user data for ${userId}:`, parseError);
+            }
+        }
+        
+        return parsedUsers;
+    } catch (error) {
+        criticalLog('REDIS-ERROR', 'Failed to get all waiting users from Redis:', error);
+        return new Map();
+    }
+}
+
+async function getAllActiveMatchesFromRedis() {
+    try {
+        const redis = await getRedisClient();
+        const keys = await redis.keys('match:*');
+        const matches = new Map();
+        
+        if (keys.length > 0) {
+            const values = await redis.mget(keys);
+            for (let i = 0; i < keys.length; i++) {
+                if (values[i]) {
+                    const matchId = keys[i].replace('match:', '');
+                    try {
+                        matches.set(matchId, JSON.parse(values[i]));
+                    } catch (parseError) {
+                        criticalLog('REDIS-ERROR', `Failed to parse match data for ${matchId}:`, parseError);
+                    }
+                }
+            }
+        }
+        
+        return matches;
+    } catch (error) {
+        criticalLog('REDIS-ERROR', 'Failed to get all matches from Redis:', error);
+        return new Map();
+    }
+}
 
 // ==========================================
 // CONFIGURATION & CONSTANTS
@@ -29,26 +171,19 @@ const SIMPLE_STRATEGY_THRESHOLD = 10;
 const HYBRID_STRATEGY_THRESHOLD = 100;
 
 // ==========================================
-// OPTIMIZED GLOBAL STATE
+// OPTIMIZED GLOBAL STATE (Now Redis-backed)
 // ==========================================
 
-let waitingUsers = new Map();
-let activeMatches = new Map();
+// Keep minimal in-memory cache for performance
+let waitingUsersCache = new Map();
+let activeMatchesCache = new Map();
+let lastCacheUpdate = 0;
+const CACHE_TTL = 5000; // 5 seconds cache
 
-// 🔥 OPTIMIZATION: Multiple indexed data structures
-let timezoneIndex = new Map(); // timezone -> Set(userIds)
-let genderIndex = new Map();   // gender -> Set(userIds)
-let freshUsersSet = new Set(); // Users < 30s
-let lastIndexRebuild = 0;
-
-// 🔥 NEW: True incremental tracking
-let addedUsers = new Set();
-let removedUsers = new Map(); // userId -> user data for cleanup
-
-// 🔥 OPTIMIZATION: Pre-calculated distance cache
-let distanceCache = new Map(); // "zone1,zone2" -> circularDistance
-let timezoneScoreTable = new Array(25); // Pre-calculated scores 0-24
-let genderScoreTable = new Map(); // Pre-calculated gender combinations
+// 🔥 OPTIMIZATION: Pre-calculated distance cache (still in-memory for speed)
+let distanceCache = new Map();
+let timezoneScoreTable = new Array(25);
+let genderScoreTable = new Map();
 
 // ==========================================
 // LOGGING UTILITIES
@@ -110,13 +245,46 @@ function initializeOptimizations() {
 initializeOptimizations();
 
 // ==========================================
+// REDIS-BACKED CACHE MANAGEMENT
+// ==========================================
+
+async function refreshCacheFromRedis() {
+    const now = Date.now();
+    if (now - lastCacheUpdate < CACHE_TTL) {
+        return; // Cache still fresh
+    }
+    
+    try {
+        // Refresh waiting users cache
+        waitingUsersCache = await getAllWaitingUsersFromRedis();
+        
+        // Refresh active matches cache  
+        activeMatchesCache = await getAllActiveMatchesFromRedis();
+        
+        lastCacheUpdate = now;
+        smartLog('CACHE', `Cache refreshed: ${waitingUsersCache.size} users, ${activeMatchesCache.size} matches`);
+    } catch (error) {
+        criticalLog('CACHE-ERROR', 'Failed to refresh cache from Redis:', error);
+    }
+}
+
+async function getWaitingUsers() {
+    await refreshCacheFromRedis();
+    return waitingUsersCache;
+}
+
+async function getActiveMatches() {
+    await refreshCacheFromRedis();
+    return activeMatchesCache;
+}
+
+// ==========================================
 // ULTRA-FAST DISTANCE CALCULATION WITH CACHE
 // ==========================================
 
 function getCircularDistance(zone1, zone2) {
     if (typeof zone1 !== 'number' || typeof zone2 !== 'number') return 12;
     
-    // Cache key (normalized)
     const cacheKey = zone1 <= zone2 ? `${zone1},${zone2}` : `${zone2},${zone1}`;
     
     if (distanceCache.has(cacheKey)) {
@@ -126,7 +294,6 @@ function getCircularDistance(zone1, zone2) {
     const linear = Math.abs(zone1 - zone2);
     const circular = linear > 12 ? 24 - linear : linear;
     
-    // Add to cache with LRU eviction
     if (distanceCache.size >= MAX_CACHE_SIZE) {
         const firstKey = distanceCache.keys().next().value;
         distanceCache.delete(firstKey);
@@ -147,155 +314,14 @@ function getGenderScore(gender1, gender2) {
 }
 
 // ==========================================
-// ✅ FIXED: REAL-TIME INDEX MANAGEMENT
+// REDIS-BACKED MATCHING STRATEGIES
 // ==========================================
 
-// Helper: Add user to indexes - O(1)
-function addUserToIndexes(userId, user) {
-    // Timezone index
-    const zone = user.chatZone;
-    if (typeof zone === 'number') {
-        if (!timezoneIndex.has(zone)) {
-            timezoneIndex.set(zone, new Set());
-        }
-        timezoneIndex.get(zone).add(userId);
-    }
-    
-    // Gender index
-    const gender = user.userInfo?.gender || 'Unspecified';
-    if (!genderIndex.has(gender)) {
-        genderIndex.set(gender, new Set());
-    }
-    genderIndex.get(gender).add(userId);
-    
-    // Fresh users (< 30 seconds)
-    if (Date.now() - user.timestamp < 30000) {
-        freshUsersSet.add(userId);
-    }
-}
-
-// ✅ FIXED: Remove user from indexes with immediate cleanup
-function removeUserFromIndexes(userId, user) {
-    if (!user) return;
-    
-    // Timezone index
-    const zone = user.chatZone;
-    if (typeof zone === 'number' && timezoneIndex.has(zone)) {
-        timezoneIndex.get(zone).delete(userId);
-        // Cleanup empty sets
-        if (timezoneIndex.get(zone).size === 0) {
-            timezoneIndex.delete(zone);
-        }
-    }
-    
-    // Gender index
-    const gender = user.userInfo?.gender || 'Unspecified';
-    if (genderIndex.has(gender)) {
-        genderIndex.get(gender).delete(userId);
-        if (genderIndex.get(gender).size === 0) {
-            genderIndex.delete(gender);
-        }
-    }
-    
-    // Fresh users
-    freshUsersSet.delete(userId);
-}
-
-function buildIndexesIfNeeded() {
-    const now = Date.now();
-    
-    // Process incremental updates first
-    if (addedUsers.size > 0 || removedUsers.size > 0) {
-        updateIndexesIncrementally();
-        return;
-    }
-    
-    // Only rebuild if absolutely necessary
-    if (now - lastIndexRebuild < INDEX_REBUILD_INTERVAL && timezoneIndex.size > 0) {
-        return; // Skip rebuild
-    }
-    
-    // Full rebuild for initial setup or periodic refresh
-    buildIndexes();
-}
-
-function buildIndexes() {
-    const now = Date.now();
-    
-    // Clear indexes
-    timezoneIndex.clear();
-    genderIndex.clear();
-    freshUsersSet.clear();
-    
-    // Build new indexes in single pass
-    for (const [userId, user] of waitingUsers.entries()) {
-        addUserToIndexes(userId, user);
-    }
-    
-    lastIndexRebuild = now;
-    
-    smartLog('INDEX-REBUILD', `Indexes built: ${timezoneIndex.size} zones, ${genderIndex.size} genders, ${freshUsersSet.size} fresh`);
-}
-
-function updateIndexesIncrementally() {
-    // Process added users - O(k) where k = số users thay đổi
-    for (const userId of addedUsers) {
-        const user = waitingUsers.get(userId);
-        if (user) {
-            addUserToIndexes(userId, user);
-        }
-    }
-    
-    // Process removed users - O(k)
-    for (const [userId, userData] of removedUsers.entries()) {
-        removeUserFromIndexes(userId, userData);
-    }
-    
-    smartLog('INDEX-UPDATE', `Incremental update: ${addedUsers.size} added, ${removedUsers.size} removed`);
-    
-    // Clear change tracking
-    addedUsers.clear();
-    removedUsers.clear();
-}
-
-// ==========================================
-// ✅ FIXED: OPTIMIZED USER OPERATIONS
-// ==========================================
-
-function addWaitingUser(userId, userData) {
-    waitingUsers.set(userId, userData);
-    // Real-time index update for immediate availability
-    addUserToIndexes(userId, userData);
-    // Track for potential batch operations (optional)
-    addedUsers.add(userId);
-}
-
-// ✅ FIXED: Immediate index cleanup
-function removeWaitingUser(userId) {
-    const user = waitingUsers.get(userId);
-    if (user) {
-        // Remove from waitingUsers first
-        waitingUsers.delete(userId);
-        
-        // Immediate index cleanup (no more batch delays)
-        removeUserFromIndexes(userId, user);
-        
-        // Clean up tracking
-        addedUsers.delete(userId);
-        removedUsers.delete(userId);
-        
-        return true;
-    }
-    return false;
-}
-
-// ==========================================
-// ✅ FIXED: MATCHING STRATEGIES WITH SELF-EXCLUSION
-// ==========================================
-
-function findSimpleMatchExcludeSelf(userId, userChatZone, userGender) {
+async function findSimpleMatchExcludeSelf(userId, userChatZone, userGender) {
     let bestMatch = null;
     let bestScore = 0;
+    
+    const waitingUsers = await getWaitingUsers();
     
     for (const [candidateId, candidate] of waitingUsers.entries()) {
         if (candidateId === userId) continue; // ✅ Skip self
@@ -329,152 +355,145 @@ function findSimpleMatchExcludeSelf(userId, userChatZone, userGender) {
     return bestMatch;
 }
 
-function findUltraFastMatchExcludeSelf(userId, userChatZone, userGender) {
-    buildIndexesIfNeeded();
+// ==========================================
+// ✅ REDIS-INTEGRATED HANDLERS
+// ==========================================
+
+async function handleInstantMatch(userId, data) {
+    const { userInfo, preferredMatchId, chatZone, gender } = data;
     
-    const now = Date.now();
-    let bestMatch = null;
-    let bestScore = 0;
+    if (!userId || typeof userId !== 'string') {
+        return createCorsResponse({ error: 'userId is required and must be string' }, 400);
+    }
     
-    // 🔥 PRIORITY 1: Same timezone + fresh users (< 30s)
-    if (typeof userChatZone === 'number') {
-        const sameZoneCandidates = timezoneIndex.get(userChatZone);
-        if (sameZoneCandidates) {
-            for (const candidateId of sameZoneCandidates) {
-                if (candidateId === userId) continue; // ✅ Skip self
-                
-                const candidate = waitingUsers.get(candidateId);
-                if (!candidate) continue;
-                
-                let score = 21; // Base score for same timezone (20 + 1)
-                
-                // Gender bonus
-                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
-                score += getGenderScore(userGender, candidateGender);
-                
-                // Fresh user mega bonus
-                if (freshUsersSet.has(candidateId)) {
-                    score += 3;
-                }
-                
-                // 🚀 EARLY EXIT: Perfect fresh match
-                if (score >= 27) {
-                    return { userId: candidateId, user: candidate, score };
-                }
-                
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMatch = { userId: candidateId, user: candidate, score };
-                }
-            }
+    smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
+    
+    // ✅ CHECK ACTIVE MATCHES FROM REDIS
+    const activeMatches = await getActiveMatches();
+    for (const [matchId, match] of activeMatches.entries()) {
+        if (match.p1 === userId || match.p2 === userId) {
+            const partnerId = match.p1 === userId ? match.p2 : match.p1;
+            return createCorsResponse({
+                status: 'already-matched',
+                matchId,
+                partnerId,
+                isInitiator: match.p1 === userId,
+                message: 'User already in active match',
+                timestamp: Date.now()
+            });
         }
     }
     
-    // 🔥 PRIORITY 2: Adjacent timezones (±1, ±2) - but only if no good same-zone match
-    if (bestScore < 23 && typeof userChatZone === 'number') {
-        const adjacentZones = [
-            userChatZone - 1, userChatZone + 1,  // ±1 hour
-            userChatZone - 2, userChatZone + 2   // ±2 hours
-        ];
+    // ADAPTIVE MATCHING STRATEGY
+    const userGender = gender || userInfo?.gender || 'Unspecified';
+    const waitingUsers = await getWaitingUsers();
+    
+    let bestMatch;
+    let strategy = 'simple';
+    
+    // For now, use simple strategy with Redis backend
+    bestMatch = await findSimpleMatchExcludeSelf(userId, chatZone, userGender);
+    
+    if (bestMatch) {
+        const partnerId = bestMatch.userId;
+        const partnerUser = bestMatch.user;
         
-        for (const adjZone of adjacentZones) {
-            const normalizedZone = ((adjZone + 12) % 24) - 12; // Handle wraparound
-            const adjCandidates = timezoneIndex.get(normalizedZone);
-            
-            if (!adjCandidates) continue;
-            
-            // Only check first 2 candidates from adjacent zones for speed
-            let checkedCount = 0;
-            for (const candidateId of adjCandidates) {
-                if (candidateId === userId || checkedCount >= 2) continue; // ✅ Skip self
-                checkedCount++;
-                
-                const candidate = waitingUsers.get(candidateId);
-                if (!candidate) continue;
-                
-                let score = 1 + getTimezoneScore(userChatZone, normalizedZone);
-                
-                // Gender bonus
-                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
-                score += getGenderScore(userGender, candidateGender);
-                
-                // Fresh bonus
-                if (freshUsersSet.has(candidateId)) {
-                    score += 2;
-                }
-                
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMatch = { userId: candidateId, user: candidate, score };
-                }
-            }
-        }
+        // ✅ REMOVE BOTH USERS FROM REDIS WAITING LIST
+        await removeWaitingUserFromRedis(userId);
+        await removeWaitingUserFromRedis(partnerId);
+        
+        // Invalidate cache
+        lastCacheUpdate = 0;
+        
+        // Create match
+        const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+        
+        const isUserInitiator = userId < partnerId;
+        const p1 = isUserInitiator ? userId : partnerId;
+        const p2 = isUserInitiator ? partnerId : userId;
+        
+        // ✅ CREATE MATCH OBJECT WITH CONNECTION TRACKING
+        const match = {
+            p1, p2,
+            timestamp: Date.now(),
+            connected: false,
+            connectedAt: null,
+            signals: { [p1]: [], [p2]: [] },
+            userInfo: {
+                [userId]: userInfo || {},
+                [partnerId]: partnerUser.userInfo || {}
+            },
+            chatZones: {
+                [userId]: chatZone,
+                [partnerId]: partnerUser.chatZone
+            },
+            matchScore: bestMatch.score,
+            strategy: strategy
+        };
+        
+        // ✅ SAVE MATCH TO REDIS
+        await setMatch(matchId, match);
+        
+        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score} | Strategy: ${strategy}`);
+        
+        return createCorsResponse({
+            status: 'instant-match',
+            matchId,
+            partnerId,
+            isInitiator: isUserInitiator,
+            partnerInfo: partnerUser.userInfo || {},
+            partnerChatZone: partnerUser.chatZone,
+            signals: [],
+            compatibility: bestMatch.score,
+            strategy: strategy,
+            message: 'Instant match found! WebRTC connection will be established.',
+            timestamp: Date.now()
+        });
+        
+    } else {
+        // ✅ ADD USER TO REDIS WAITING LIST
+        const waitingUser = {
+            userId,
+            userInfo: userInfo || {},
+            chatZone: chatZone || null,
+            timestamp: Date.now()
+        };
+        
+        await addWaitingUserToRedis(userId, waitingUser);
+        
+        // Invalidate cache
+        lastCacheUpdate = 0;
+        
+        const currentWaitingUsers = await getWaitingUsers();
+        const position = Array.from(currentWaitingUsers.keys()).indexOf(userId) + 1;
+        
+        return createCorsResponse({
+            status: 'waiting',
+            position: position || currentWaitingUsers.size,
+            waitingUsers: currentWaitingUsers.size,
+            chatZone: chatZone,
+            userGender: userGender,
+            strategy: strategy,
+            message: 'Added to matching queue. Waiting for partner...',
+            estimatedWaitTime: Math.min(currentWaitingUsers.size * 2, 30),
+            timestamp: Date.now()
+        });
     }
-    
-    // 🔥 PRIORITY 3: Any timezone - only if no decent match found
-    if (bestScore < 15) {
-        let checkedCount = 0;
-        for (const [candidateId, candidate] of waitingUsers.entries()) {
-            if (candidateId === userId || checkedCount >= 5) break; // ✅ Skip self
-            checkedCount++;
-            
-            let score = 1 + getTimezoneScore(userChatZone, candidate.chatZone);
-            
-            const candidateGender = candidate.userInfo?.gender || 'Unspecified';
-            score += getGenderScore(userGender, candidateGender);
-            
-            if (freshUsersSet.has(candidateId)) {
-                score += 1;
-            }
-            
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = { userId: candidateId, user: candidate, score };
-            }
-        }
-    }
-    
-    return bestMatch;
 }
 
-function findHybridMatchExcludeSelf(userId, userChatZone, userGender) {
-    // If small user count, use simple approach
-    if (waitingUsers.size <= 20) {
-        return findSimpleMatchExcludeSelf(userId, userChatZone, userGender);
-    }
-    
-    // If many null/undefined timezones, use simple approach
-    const validTimezoneUsers = Array.from(waitingUsers.values())
-        .filter(u => typeof u.chatZone === 'number').length;
-    
-    if (validTimezoneUsers < waitingUsers.size * 0.5) {
-        return findSimpleMatchExcludeSelf(userId, userChatZone, userGender);
-    }
-    
-    // Otherwise use optimized approach
-    buildIndexesIfNeeded();
-    return findUltraFastMatchExcludeSelf(userId, userChatZone, userGender);
-}
-
-// ==========================================
-// ✅ FIXED: INSTANT MATCH HANDLER (NO RACE CONDITIONS)
-// ==========================================
-
-
-// ==========================================
-// ✅ FIXED: OTHER HANDLERS
-// ==========================================
-
-function handleGetSignals(userId, data) {
+async function handleGetSignals(userId, data) {
     const { chatZone, gender, userInfo } = data;
     
-    // Kiểm tra active matches trước
+    // ✅ CHECK ACTIVE MATCHES FROM REDIS
+    const activeMatches = await getActiveMatches();
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             const partnerId = match.p1 === userId ? match.p2 : match.p1;
             const signals = match.signals[userId] || [];
             
+            // Clear signals after retrieval and update Redis
             match.signals[userId] = [];
+            await setMatch(matchId, match);
             
             smartLog('GET-SIGNALS', `${userId.slice(-8)} -> ${signals.length} signals`);
             
@@ -492,7 +511,8 @@ function handleGetSignals(userId, data) {
         }
     }
     
-    // ✅ Kiểm tra waiting list với auto-recovery
+    // ✅ CHECK WAITING LIST FROM REDIS
+    const waitingUsers = await getWaitingUsers();
     if (waitingUsers.has(userId)) {
         const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
         return createCorsResponse({
@@ -504,7 +524,7 @@ function handleGetSignals(userId, data) {
             timestamp: Date.now()
         });
     } else {
-        // ✅ AUTO-RECOVERY: Tự động thêm lại user nếu có đủ thông tin
+        // ✅ AUTO-RECOVERY: Add user back to Redis if has enough info
         if (chatZone !== undefined) {
             const waitingUser = {
                 userId,
@@ -513,14 +533,15 @@ function handleGetSignals(userId, data) {
                 timestamp: Date.now()
             };
             
-            addWaitingUser(userId, waitingUser);
+            await addWaitingUserToRedis(userId, waitingUser);
+            lastCacheUpdate = 0; // Invalidate cache
             
             smartLog('GET-SIGNALS', `${userId.slice(-8)} auto-recovered to waiting list`);
             
             return createCorsResponse({
                 status: 'waiting',
-                position: waitingUsers.size,
-                waitingUsers: waitingUsers.size,
+                position: (await getWaitingUsers()).size,
+                waitingUsers: (await getWaitingUsers()).size,
                 chatZone: chatZone,
                 userGender: gender || 'Unspecified',
                 message: 'Auto-recovered to waiting list',
@@ -537,7 +558,7 @@ function handleGetSignals(userId, data) {
     });
 }
 
-function handleSendSignal(userId, data) {
+async function handleSendSignal(userId, data) {
     const { matchId, type, payload } = data;
     
     if (!matchId || !type || !payload) {
@@ -547,7 +568,8 @@ function handleSendSignal(userId, data) {
         }, 400);
     }
     
-    const match = activeMatches.get(matchId);
+    // ✅ GET MATCH FROM REDIS
+    const match = await getMatch(matchId);
     if (!match) {
         return createCorsResponse({ 
             error: 'Match not found',
@@ -579,6 +601,9 @@ function handleSendSignal(userId, data) {
         match.signals[partnerId] = match.signals[partnerId].slice(-50);
     }
     
+    // ✅ UPDATE MATCH IN REDIS
+    await setMatch(matchId, match);
+    
     smartLog('SEND-SIGNAL', `${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type})`);
     
     return createCorsResponse({
@@ -590,27 +615,29 @@ function handleSendSignal(userId, data) {
     });
 }
 
-function handleP2pConnected(userId, data) {
+async function handleP2pConnected(userId, data) {
     const { matchId, partnerId } = data;
     criticalLog('P2P-CONNECTED', `${matchId} - ${userId.slice(-8)} connected`);
     
     let removed = false;
     
-    // ✅ FIX: CHỈ xóa khỏi waiting list
-    if (removeWaitingUser(userId)) removed = true;
-    if (removeWaitingUser(partnerId)) removed = true;
+    // ✅ REMOVE FROM REDIS WAITING LIST
+    if (await removeWaitingUserFromRedis(userId)) removed = true;
+    if (await removeWaitingUserFromRedis(partnerId)) removed = true;
     
-    // ✅ FIX: KHÔNG xóa match, chỉ đánh dấu là connected
-    const match = activeMatches.get(matchId);
+    // ✅ UPDATE MATCH STATUS IN REDIS
+    const match = await getMatch(matchId);
     if (match) {
         match.connected = true;
         match.connectedAt = Date.now();
-        criticalLog('P2P-CONNECTED', `Match ${matchId} marked as connected`);
+        await setMatch(matchId, match);
+        criticalLog('P2P-CONNECTED', `Match ${matchId} marked as connected in Redis`);
     } else {
-        criticalLog('P2P-CONNECTED', `Match ${matchId} not found (may have been cleaned up)`);
+        criticalLog('P2P-CONNECTED', `Match ${matchId} not found in Redis`);
     }
     
-    // ❌ REMOVED: activeMatches.delete(matchId);
+    // Invalidate cache
+    lastCacheUpdate = 0;
     
     return createCorsResponse({
         status: 'p2p_connected',
@@ -620,15 +647,16 @@ function handleP2pConnected(userId, data) {
     });
 }
 
-function handleDisconnect(userId) {
+async function handleDisconnect(userId) {
     criticalLog('DISCONNECT', userId.slice(-8));
     
     let removed = false;
     
-    // Use optimized removal
-    if (removeWaitingUser(userId)) removed = true;
+    // ✅ REMOVE FROM REDIS WAITING LIST
+    if (await removeWaitingUserFromRedis(userId)) removed = true;
     
-    // ✅ FIX: Better match cleanup on disconnect
+    // ✅ HANDLE MATCH DISCONNECT IN REDIS
+    const activeMatches = await getActiveMatches();
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             const partnerId = match.p1 === userId ? match.p2 : match.p1;
@@ -643,22 +671,28 @@ function handleDisconnect(userId) {
                 });
             }
             
-            // ✅ FIX: Mark match as disconnected instead of immediate deletion
+            // Mark match as disconnected
             match.disconnected = true;
             match.disconnectedAt = Date.now();
             match.disconnectedBy = userId;
             
-            // ✅ DELETE after a short delay to allow partner to receive disconnect signal
-            setTimeout(() => {
-                activeMatches.delete(matchId);
-                criticalLog('DISCONNECT', `Delayed removal of match ${matchId}`);
-            }, 5000); // 5 second delay
+            // Update match in Redis
+            await setMatch(matchId, match);
             
-            criticalLog('DISCONNECT', `Match ${matchId} marked for removal`);
+            // Schedule deletion after delay
+            setTimeout(async () => {
+                await deleteMatch(matchId);
+                criticalLog('DISCONNECT', `Delayed removal of match ${matchId} from Redis`);
+            }, 5000);
+            
+            criticalLog('DISCONNECT', `Match ${matchId} marked for removal in Redis`);
             removed = true;
             break;
         }
     }
+    
+    // Invalidate cache
+    lastCacheUpdate = 0;
     
     return createCorsResponse({ 
         status: 'disconnected',
@@ -668,239 +702,89 @@ function handleDisconnect(userId) {
 }
 
 // ==========================================
-// OPTIMIZED CLEANUP
+// REDIS-BACKED CLEANUP
 // ==========================================
-function cleanup() {
+
+async function cleanup() {
     const now = Date.now();
     let cleanedUsers = 0;
     let cleanedMatches = 0;
     
-    // ✅ TIMEOUTS - Phân biệt signaling và connected
-    const SIGNALING_TIMEOUT = 120000;  // 2 phút cho signaling exchange
-    const CONNECTED_TIMEOUT = 300000;  // 5 phút sau khi P2P connected
-    const USER_TIMEOUT = 120000;       // 2 phút cho waiting users
+    const SIGNALING_TIMEOUT = 120000;  // 2 minutes
+    const CONNECTED_TIMEOUT = 300000;  // 5 minutes  
+    const USER_TIMEOUT = 120000;       // 2 minutes
     
-    // Batch cleanup - collect expired IDs first
-    const expiredUsers = [];
-    for (const [userId, user] of waitingUsers.entries()) {
-        if (now - user.timestamp > USER_TIMEOUT) {
-            expiredUsers.push(userId);
-        }
-    }
-    
-    // ✅ FIX: Smart match cleanup based on connection status
-    const expiredMatches = [];
-    for (const [matchId, match] of activeMatches.entries()) {
-        const age = now - match.timestamp;
+    try {
+        // ✅ CLEANUP WAITING USERS FROM REDIS
+        const waitingUsers = await getAllWaitingUsersFromRedis();
+        const expiredUsers = [];
         
-        if (!match.connected) {
-            // ✅ Match chưa connected - chỉ xóa sau 2 phút signaling
-            if (age > SIGNALING_TIMEOUT) {
-                // expiredMatches.push(matchId);
-                criticalLog('CLEANUP', `Expired signaling match: ${matchId} (${Math.round(age/1000)}s old)`);
-            }
-        } else {
-            // ✅ Match đã connected - xóa sau 5 phút connected
-            const connectedAge = now - match.connectedAt;
-            if (connectedAge > CONNECTED_TIMEOUT) {
-                // expiredMatches.push(matchId);
-                criticalLog('CLEANUP', `Expired connected match: ${matchId} (connected ${Math.round(connectedAge/1000)}s ago)`);
+        for (const [userId, user] of waitingUsers.entries()) {
+            if (now - user.timestamp > USER_TIMEOUT) {
+                expiredUsers.push(userId);
             }
         }
-    }
-    
-    // Batch delete using optimized removal
-    expiredUsers.forEach(userId => {
-        if (removeWaitingUser(userId)) cleanedUsers++;
-    });
-    
-    expiredMatches.forEach(matchId => {
-        activeMatches.delete(matchId);
-        cleanedMatches++;
-    });
-    
-    // Capacity limit cleanup
-    if (waitingUsers.size > MAX_WAITING_USERS) {
-        const excess = waitingUsers.size - MAX_WAITING_USERS;
-        const oldestUsers = Array.from(waitingUsers.entries())
-            .sort((a, b) => a[1].timestamp - b[1].timestamp)
-            .slice(0, excess)
-            .map(entry => entry[0]);
         
-        oldestUsers.forEach(userId => {
-            if (removeWaitingUser(userId)) cleanedUsers++;
-        });
-    }
-    
-    if (cleanedUsers > 0 || cleanedMatches > 0) {
-        criticalLog('CLEANUP', `Removed ${cleanedUsers} users, ${cleanedMatches} matches. Active: ${waitingUsers.size} waiting, ${activeMatches.size} matched`);
+        for (const userId of expiredUsers) {
+            if (await removeWaitingUserFromRedis(userId)) {
+                cleanedUsers++;
+            }
+        }
+        
+        // ✅ CLEANUP MATCHES FROM REDIS
+        const activeMatches = await getAllActiveMatchesFromRedis();
+        const expiredMatches = [];
+        
+        for (const [matchId, match] of activeMatches.entries()) {
+            const age = now - match.timestamp;
+            
+            if (!match.connected) {
+                if (age > SIGNALING_TIMEOUT) {
+                    expiredMatches.push(matchId);
+                    criticalLog('CLEANUP', `Expired signaling match: ${matchId} (${Math.round(age/1000)}s old)`);
+                }
+            } else {
+                const connectedAge = now - match.connectedAt;
+                if (connectedAge > CONNECTED_TIMEOUT) {
+                    expiredMatches.push(matchId);
+                    criticalLog('CLEANUP', `Expired connected match: ${matchId} (connected ${Math.round(connectedAge/1000)}s ago)`);
+                }
+            }
+        }
+        
+        for (const matchId of expiredMatches) {
+            await deleteMatch(matchId);
+            cleanedMatches++;
+        }
+        
+        // Invalidate cache after cleanup
+        lastCacheUpdate = 0;
+        
+        if (cleanedUsers > 0 || cleanedMatches > 0) {
+            criticalLog('CLEANUP', `Removed ${cleanedUsers} users, ${cleanedMatches} matches from Redis`);
+        }
+        
+    } catch (error) {
+        criticalLog('CLEANUP-ERROR', 'Redis cleanup failed:', error);
     }
 }
 
 // ==========================================
-// 3. ✅ FIXED: handleInstantMatch - Ensure match object has proper structure
-// ==========================================
-
-function handleInstantMatch(userId, data) {
-    const { userInfo, preferredMatchId, chatZone, gender } = data;
-    
-    // MINIMAL VALIDATION - NO chatZone validation to avoid 400 error
-    if (!userId || typeof userId !== 'string') {
-        return createCorsResponse({ error: 'userId is required and must be string' }, 400);
-    }
-    
-    smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
-    
-    // ✅ KIỂM TRA ACTIVE MATCHES TRƯỚC - không thay đổi
-    for (const [matchId, match] of activeMatches.entries()) {
-        if (match.p1 === userId || match.p2 === userId) {
-            const partnerId = match.p1 === userId ? match.p2 : match.p1;
-            return createCorsResponse({
-                status: 'already-matched',
-                matchId,
-                partnerId,
-                isInitiator: match.p1 === userId,
-                message: 'User already in active match',
-                timestamp: Date.now()
-            });
-        }
-    }
-    
-    // 🔧 ADAPTIVE MATCHING STRATEGY
-    const userGender = gender || userInfo?.gender || 'Unspecified';
-    const startTime = Date.now();
-    
-    let bestMatch;
-    let strategy;
-    
-    if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
-        bestMatch = findSimpleMatchExcludeSelf(userId, chatZone, userGender);
-        strategy = 'simple';
-    } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
-        bestMatch = findHybridMatchExcludeSelf(userId, chatZone, userGender);
-        strategy = 'hybrid';
-    } else {
-        buildIndexesIfNeeded();
-        bestMatch = findUltraFastMatchExcludeSelf(userId, chatZone, userGender);
-        strategy = 'optimized';
-    }
-    
-    if (bestMatch) {
-        const partnerId = bestMatch.userId;
-        const partnerUser = bestMatch.user;
-        
-        // ✅ FIX: CHỈ xóa cả 2 users KHI tìm thấy match
-        removeWaitingUser(userId);
-        removeWaitingUser(partnerId);
-        
-        // Create match
-        const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-        
-        const isUserInitiator = userId < partnerId;
-        const p1 = isUserInitiator ? userId : partnerId;
-        const p2 = isUserInitiator ? partnerId : userId;
-        
-        // ✅ FIX: Enhanced match object with connection tracking
-        const match = {
-            p1, p2,
-            timestamp: Date.now(),
-            connected: false,           // ✅ NEW: Track connection status
-            connectedAt: null,          // ✅ NEW: Track when P2P connected
-            signals: { [p1]: [], [p2]: [] },
-            userInfo: {
-                [userId]: userInfo || {},
-                [partnerId]: partnerUser.userInfo || {}
-            },
-            chatZones: {
-                [userId]: chatZone,
-                [partnerId]: partnerUser.chatZone
-            },
-            matchScore: bestMatch.score,
-            strategy: strategy
-        };
-        
-        activeMatches.set(matchId, match);
-        
-        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score} | Strategy: ${strategy}`);
-        
-        return createCorsResponse({
-            status: 'instant-match',
-            matchId,
-            partnerId,
-            isInitiator: isUserInitiator,
-            partnerInfo: partnerUser.userInfo || {},
-            partnerChatZone: partnerUser.chatZone,
-            signals: [],
-            compatibility: bestMatch.score,
-            strategy: strategy,
-            message: 'Instant match found! WebRTC connection will be established.',
-            timestamp: Date.now()
-        });
-        
-    } else {
-        // ✅ FIX: Thêm hoặc update user trong waiting list
-        const waitingUser = {
-            userId,
-            userInfo: userInfo || {},
-            chatZone: chatZone || null,
-            timestamp: Date.now()
-        };
-        
-        // Kiểm tra xem user đã có trong waiting list chưa
-        if (waitingUsers.has(userId)) {
-            // Update thông tin user hiện tại
-            const existingUser = waitingUsers.get(userId);
-            existingUser.userInfo = userInfo || existingUser.userInfo || {};
-            existingUser.chatZone = chatZone !== undefined ? chatZone : existingUser.chatZone;
-            existingUser.timestamp = Date.now(); // Update timestamp
-            
-            // Update indexes if needed
-            removeUserFromIndexes(userId, existingUser);
-            addUserToIndexes(userId, existingUser);
-            
-            smartLog('INSTANT-MATCH', `${userId.slice(-8)} updated in waiting list`);
-        } else {
-            // Thêm user mới vào waiting list
-            addWaitingUser(userId, waitingUser);
-            smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list`);
-        }
-        
-        const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
-        
-        return createCorsResponse({
-            status: 'waiting',
-            position,
-            waitingUsers: waitingUsers.size,
-            chatZone: chatZone,
-            userGender: userGender,
-            strategy: strategy || 'simple',
-            message: 'Added to matching queue. Waiting for partner...',
-            estimatedWaitTime: Math.min(waitingUsers.size * 2, 30),
-            timestamp: Date.now()
-        });
-    }
-}
-
-
-// ==========================================
-// ✅ FIXED: REQUEST BODY PARSING FOR VERCEL EDGE
+// REQUEST BODY PARSING
 // ==========================================
 
 async function parseRequestBody(request) {
     try {
-        // Method 1: Try built-in json() method first (most reliable for Vercel Edge)
         if (request.headers.get('content-type')?.includes('application/json')) {
             return await request.json();
         }
         
-        // Method 2: Handle text/plain body (fallback)
         const textBody = await request.text();
         
         if (!textBody || !textBody.trim()) {
             throw new Error('Empty request body');
         }
         
-        // Try to parse as JSON
         try {
             return JSON.parse(textBody);
         } catch (parseError) {
@@ -913,13 +797,16 @@ async function parseRequestBody(request) {
 }
 
 // ==========================================
-// MAIN HANDLER FUNCTION - VERCEL EDGE OPTIMIZED
+// MAIN HANDLER FUNCTION - REDIS INTEGRATED
 // ==========================================
 
 export default async function handler(request) {
-    // Quick cleanup at start to prevent timeouts
     const startTime = Date.now();
-    cleanup();
+    
+    // Perform cleanup periodically
+    if (Math.random() < 0.1) { // 10% chance to cleanup on each request
+        cleanup().catch(err => criticalLog('CLEANUP-ERROR', err));
+    }
     
     if (request.method === 'OPTIONS') {
         return createCorsResponse(null, 200);
@@ -930,35 +817,26 @@ export default async function handler(request) {
         const debug = url.searchParams.get('debug');
         
         if (debug === 'true') {
+            const waitingUsers = await getWaitingUsers();
+            const activeMatches = await getActiveMatches();
+            
             return createCorsResponse({
-                status: 'hybrid-optimized-webrtc-signaling-vercel-fixed',
+                status: 'hybrid-optimized-webrtc-signaling-redis-integrated',
                 runtime: 'vercel-edge',
-                version: '2.1-vercel-fixed',
-                strategies: {
-                    simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
-                    hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
-                    optimized: `>${HYBRID_STRATEGY_THRESHOLD} users`
-                },
+                version: '3.0-redis-integrated',
+                storage: 'Redis Labs',
                 fixes: [
-                    'Vercel Edge Runtime compatible request body parsing',
-                    'Timeout prevention with fast cleanup',
-                    'Race condition eliminated in instant-match',
-                    'Real-time index synchronization',
-                    'Auto-recovery in get-signals',
-                    'Self-exclusion in all matching strategies'
+                    'Redis integration for multi-instance compatibility',
+                    'Distributed state management',
+                    'No more 404 Match not found errors',
+                    'Persistent signaling across instances',
+                    'Real-time cache with Redis backend'
                 ],
                 stats: {
                     waitingUsers: waitingUsers.size,
                     activeMatches: activeMatches.size,
-                    cacheSize: distanceCache.size,
-                    indexStats: {
-                        timezones: timezoneIndex.size,
-                        genders: genderIndex.size,
-                        freshUsers: freshUsersSet.size,
-                        lastRebuild: Date.now() - lastIndexRebuild,
-                        pendingAdds: addedUsers.size,
-                        pendingRemoves: removedUsers.size
-                    }
+                    cacheAge: Date.now() - lastCacheUpdate,
+                    redisConnected: !!redisClient
                 },
                 performance: {
                     startupTime: Date.now() - startTime
@@ -968,16 +846,10 @@ export default async function handler(request) {
         }
         
         return createCorsResponse({ 
-            status: 'hybrid-optimized-signaling-vercel-ready',
+            status: 'redis-integrated-signaling-ready',
             runtime: 'vercel-edge',
-            version: '2.1-vercel-fixed',
-            stats: { 
-                waiting: waitingUsers.size, 
-                matches: activeMatches.size,
-                strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
-                         waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
-            },
-            message: 'Vercel Edge optimized WebRTC signaling server ready!',
+            version: '3.0-redis',
+            message: 'Redis-integrated WebRTC signaling server ready!',
             timestamp: Date.now()
         });
     }
@@ -987,9 +859,7 @@ export default async function handler(request) {
     }
     
     try {
-        // ✅ FIXED: Vercel Edge compatible body parsing
         const data = await parseRequestBody(request);
-        
         const { action, userId } = data;
 
         if (!action || !userId) {
@@ -1000,8 +870,8 @@ export default async function handler(request) {
             }, 400);
         }
 
-        // Quick timeout check
-        if (Date.now() - startTime > 55000) { // 55 seconds safety margin
+        // Timeout protection
+        if (Date.now() - startTime > 8000) { // 8 seconds for edge runtime
             criticalLog('TIMEOUT-WARNING', `Request taking too long: ${Date.now() - startTime}ms`);
             return createCorsResponse({
                 error: 'Request timeout prevention',
@@ -1009,18 +879,18 @@ export default async function handler(request) {
             }, 408);
         }
 
-        // Handle different actions with timeout protection
+        // Handle different actions with Redis backend
         switch (action) {
             case 'instant-match':
-                return handleInstantMatch(userId, data);
+                return await handleInstantMatch(userId, data);
             case 'get-signals':
-                return handleGetSignals(userId, data);
+                return await handleGetSignals(userId, data);
             case 'send-signal':
-                return handleSendSignal(userId, data);
+                return await handleSendSignal(userId, data);
             case 'p2p-connected':
-                return handleP2pConnected(userId, data);
+                return await handleP2pConnected(userId, data);
             case 'disconnect':
-                return handleDisconnect(userId);
+                return await handleDisconnect(userId);
             default:
                 return createCorsResponse({
                     error: 'Unknown action',
@@ -1038,8 +908,8 @@ export default async function handler(request) {
             message: error.message,
             type: error.constructor.name,
             processing_time: Date.now() - startTime,
-            tip: 'Check request format and try again'
+            tip: 'Check request format and try again',
+            redis_connected: !!redisClient
         }, 500);
     }
 }
-
