@@ -1,385 +1,96 @@
-// 🚀 WEBRTC SIGNALING SERVER - NODE.JS + REDIS LABS
+// 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - VERCEL EDGE FIXED
 
-const { createClient } = require('redis');
+// ✅ CRITICAL: Vercel Edge Runtime configuration
+export const config = {runtime: 'edge'}
 
 const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
-// FIXED REDIS CONFIGURATION FOR NODE.JS
+// CONFIGURATION & CONSTANTS
 // ==========================================
 
-let redisClient = null;
-// ✅ ROBUST parseNodeJSBody for large SDP payloads
-// ✅ Enhanced parseNodeJSBody to handle both text/plain and application/json
-async function parseNodeJSBody(req) {
-    return new Promise((resolve, reject) => {
-        const chunks = [];
-        let totalSize = 0;
-        const maxSize = 10 * 1024 * 1024; // 10MB limit
-        
-        // ✅ Detect Content-Type
-        const contentType = req.headers['content-type'] || 'text/plain';
-        console.log(`📦 [PARSE] Content-Type: ${contentType}`);
-        
-        const timeout = setTimeout(() => {
-            console.error('❌ [PARSE] Request body parsing timeout after 15s');
-            reject(new Error('Request body parsing timeout'));
-        }, 15000); // Increased timeout for large payloads
-        
-        req.on('data', (chunk) => {
-            totalSize += chunk.length;
-            
-            if (totalSize > maxSize) {
-                clearTimeout(timeout);
-                console.error(`❌ [PARSE] Request body too large: ${totalSize} bytes`);
-                reject(new Error('Request body too large'));
-                return;
-            }
-            
-            chunks.push(chunk);
-            console.log(`📦 [PARSE] Chunk received: ${chunk.length} bytes (total: ${totalSize})`);
-        });
-        
-        req.on('end', () => {
-            clearTimeout(timeout);
-            
-            try {
-                // ✅ Proper Buffer concatenation
-                const body = Buffer.concat(chunks).toString('utf8');
-                console.log(`📦 [PARSE] Body assembled: ${body.length} chars`);
-                console.log(`📦 [PARSE] Body preview: ${body.substring(0, 200)}...`);
-                
-                if (!body.trim()) {
-                    console.error('❌ [PARSE] Empty request body');
-                    reject(new Error('Empty request body'));
-                    return;
-                }
-                
-                // ✅ Handle different content types
-                let parsed;
-                
-                if (contentType.includes('application/json')) {
-                    console.log('📦 [PARSE] Parsing as JSON (application/json)');
-                    parsed = JSON.parse(body);
-                } else if (contentType.includes('text/plain')) {
-                    console.log('📦 [PARSE] Parsing as JSON from text/plain');
-                    // Validate JSON structure first
-                    if (!body.startsWith('{') || !body.endsWith('}')) {
-                        console.error('❌ [PARSE] Invalid JSON structure in text/plain:', {
-                            starts: body.substring(0, 50),
-                            ends: body.substring(body.length - 50)
-                        });
-                        reject(new Error('Invalid JSON structure in text/plain'));
-                        return;
-                    }
-                    parsed = JSON.parse(body);
-                } else {
-                    // Fallback: try to parse as JSON anyway
-                    console.log(`📦 [PARSE] Unknown content-type ${contentType}, attempting JSON parse`);
-                    parsed = JSON.parse(body);
-                }
-                
-                console.log(`✅ [PARSE] Successfully parsed ${contentType}, action: ${parsed.action}`);
-                
-                // ✅ Enhanced logging for specific actions
-                if (parsed.action === 'send-signal' && parsed.payload?.sdp) {
-                    console.log(`📦 [PARSE] SDP signal detected: ${parsed.type}, SDP size: ${parsed.payload.sdp.length}`);
-                }
-                
-                resolve(parsed);
-                
-            } catch (error) {
-                console.error('❌ [PARSE] JSON parse error:', error.message);
-                console.error('❌ [PARSE] Content-Type:', contentType);
-                console.error('❌ [PARSE] Body preview:', body ? body.substring(0, 500) + '...' : 'null');
-                console.error('❌ [PARSE] Body suffix:', body ? '...' + body.substring(body.length - 200) : 'null');
-                reject(new Error(`JSON parse error for ${contentType}: ${error.message}`));
-            }
-        });
-        
-        req.on('error', (error) => {
-            clearTimeout(timeout);
-            console.error('❌ [PARSE] Stream error:', error);
-            reject(new Error(`Stream error: ${error.message}`));
-        });
-        
-        req.on('close', () => {
-            clearTimeout(timeout);
-            console.log('📦 [PARSE] Request connection closed');
-        });
-    });
-}
-async function getRedisClient() {
-    if (!redisClient) {
-        redisClient = createClient({
-            // ✅ FIX: Bỏ s khỏi rediss://
-            url: "redis://default:SXZanOZvHCZurRd8dTCudyIKvciwuNz0@redis-12481.c294.ap-northeast-1-2.ec2.redns.redis-cloud.com:12481",
-            socket: {
-                // ✅ FIX: Bỏ toàn bộ TLS config
-                connectTimeout: 10000,
-                commandTimeout: 5000
-            },
-            retry_strategy: (options) => {
-                if (options.error && options.error.code === 'ECONNREFUSED') {
-                    return new Error('The server refused the connection');
-                }
-                if (options.total_retry_time > 1000 * 60 * 60) {
-                    return new Error('Retry time exhausted');
-                }
-                if (options.attempt > 10) {
-                    return undefined;
-                }
-                return Math.min(options.attempt * 100, 3000);
-            }
-        });
-        
-        redisClient.on('error', (err) => {
-            console.log('[REDIS-ERROR] Redis Client Error:', err);
-        });
-        
-        redisClient.on('connect', () => {
-            console.log('[REDIS] Connected to Redis Labs');
-        });
-        
-        try {
-            await redisClient.connect();
-            console.log('[REDIS] Redis connection established successfully');
-        } catch (error) {
-            console.error('[REDIS-ERROR] Failed to connect to Redis:', error);
-            throw error;
-        }
-    }
-    return redisClient;
-}
-// ==========================================
-// REDIS HELPER FUNCTIONS
-// ==========================================
+const USER_TIMEOUT = 120000; // 2 minutes for waiting users
+const MATCH_LIFETIME = 600000; // 10 minutes for active matches
+const MAX_WAITING_USERS = 120000; // Prevent memory bloat
 
-async function setMatch(matchId, match) {
-    try {
-        const redis = await getRedisClient();
-        await redis.setEx(`match:${matchId}`, 600, JSON.stringify(match));
-        console.log(`[REDIS] Match ${matchId} saved`);
-    } catch (error) {
-        console.error(`[REDIS-ERROR] Failed to save match ${matchId}:`, error);
-        throw error;
-    }
-}
-
-async function getMatch(matchId) {
-    try {
-        const redis = await getRedisClient();
-        const data = await redis.get(`match:${matchId}`);
-        if (data) {
-            return JSON.parse(data);
-        }
-        return null;
-    } catch (error) {
-        console.error(`[REDIS-ERROR] Failed to get match ${matchId}:`, error);
-        return null;
-    }
-}
-
-async function deleteMatch(matchId) {
-    try {
-        const redis = await getRedisClient();
-        await redis.del(`match:${matchId}`);
-        console.log(`[REDIS] Match ${matchId} deleted`);
-    } catch (error) {
-        console.error(`[REDIS-ERROR] Failed to delete match ${matchId}:`, error);
-    }
-}
-
-async function addWaitingUserToRedis(userId, userData) {
-    try {
-        const redis = await getRedisClient();
-        await redis.hSet('waiting_users', userId, JSON.stringify(userData));
-        await redis.expire('waiting_users', 300);
-        console.log(`[REDIS] User ${userId.slice(-8)} added to waiting list`);
-    } catch (error) {
-        console.error(`[REDIS-ERROR] Failed to add user ${userId}:`, error);
-    }
-}
-
-async function removeWaitingUserFromRedis(userId) {
-    try {
-        const redis = await getRedisClient();
-        const removed = await redis.hDel('waiting_users', userId);
-        console.log(`[REDIS] User ${userId.slice(-8)} removed from waiting list`);
-        return removed > 0;
-    } catch (error) {
-        console.error(`[REDIS-ERROR] Failed to remove user ${userId}:`, error);
-        return false;
-    }
-}
-async function handleP2pConnected(userId, data) {
-    const { matchId, partnerId } = data;
-    
-    console.log(`[P2P-CONNECTED] ${userId.slice(-8)} connected to match ${matchId?.slice(-8)}`);
-    
-    try {
-        // Remove from waiting list if still there
-        let removed = false;
-        if (await removeWaitingUserFromRedis(userId)) removed = true;
-        if (partnerId && await removeWaitingUserFromRedis(partnerId)) removed = true;
-        
-        // Update match status
-        if (matchId) {
-            const match = await getMatch(matchId);
-            if (match) {
-                match.connected = true;
-                match.connectedAt = Date.now();
-                await setMatch(matchId, match);
-                
-                console.log(`[P2P-CONNECTED] ✅ Match ${matchId.slice(-8)} marked as connected`);
-                
-                return {
-                    statusCode: 200,
-                    body: JSON.stringify({
-                        status: 'p2p_connected',
-                        removed,
-                        matchPreserved: true,
-                        timestamp: Date.now()
-                    })
-                };
-            } else {
-                console.log(`[P2P-CONNECTED] ⚠️ Match ${matchId.slice(-8)} not found`);
-            }
-        }
-        
-        return {
-            statusCode: 200,
-            body: JSON.stringify({
-                status: 'p2p_connected',
-                removed,
-                matchPreserved: false,
-                message: 'Match not found but users removed from waiting list',
-                timestamp: Date.now()
-            })
-        };
-        
-    } catch (error) {
-        console.error(`[P2P-CONNECTED-ERROR] ${userId.slice(-8)}:`, error.message);
-        
-        return {
-            statusCode: 500,
-            body: JSON.stringify({
-                error: 'Failed to handle P2P connection',
-                message: error.message,
-                timestamp: Date.now()
-            })
-        };
-    }
-}
-async function handleDisconnect(userId) {
-    console.log(`[DISCONNECT] ${userId.slice(-8)} disconnecting`);
-    
-    try {
-        let removed = false;
-        
-        // Remove from waiting list
-        if (await removeWaitingUserFromRedis(userId)) {
-            removed = true;
-            console.log(`[DISCONNECT] ${userId.slice(-8)} removed from waiting list`);
-        }
-        
-        // Find and handle active matches
-        const redis = await getRedisClient();
-        const matchKeys = await redis.keys('match:*');
-        
-        for (const key of matchKeys) {
-            const matchId = key.replace('match:', '');
-            const match = await getMatch(matchId);
-            
-            if (match && (match.p1 === userId || match.p2 === userId)) {
-                const partnerId = match.p1 === userId ? match.p2 : match.p1;
-                
-                // Send disconnect signal to partner
-                if (match.signals && match.signals[partnerId]) {
-                    match.signals[partnerId].push({
-                        type: 'disconnect',
-                        payload: { reason: 'partner_disconnected' },
-                        from: userId,
-                        timestamp: Date.now()
-                    });
-                    
-                    await setMatch(matchId, match);
-                }
-                
-                // Schedule match deletion after delay
-                setTimeout(async () => {
-                    await deleteMatch(matchId);
-                    console.log(`[DISCONNECT] ⏰ Delayed removal of match ${matchId.slice(-8)}`);
-                }, 5000);
-                
-                console.log(`[DISCONNECT] 📤 Disconnect signal sent to ${partnerId.slice(-8)}, match ${matchId.slice(-8)} scheduled for removal`);
-                removed = true;
-                break;
-            }
-        }
-        
-        return {
-            statusCode: 200,
-            body: JSON.stringify({
-                status: 'disconnected',
-                removed,
-                timestamp: Date.now()
-            })
-        };
-        
-    } catch (error) {
-        console.error(`[DISCONNECT-ERROR] ${userId.slice(-8)}:`, error.message);
-        
-        return {
-            statusCode: 500,
-            body: JSON.stringify({
-                error: 'Failed to handle disconnect',
-                message: error.message,
-                timestamp: Date.now()
-            })
-        };
-    }
-}
-async function getAllWaitingUsersFromRedis() {
-    try {
-        const redis = await getRedisClient();
-        const users = await redis.hGetAll('waiting_users');
-        const parsedUsers = new Map();
-        
-        for (const [userId, userData] of Object.entries(users)) {
-            try {
-                parsedUsers.set(userId, JSON.parse(userData));
-            } catch (parseError) {
-                console.error(`[REDIS-ERROR] Failed to parse user data for ${userId}:`, parseError);
-            }
-        }
-        
-        return parsedUsers;
-    } catch (error) {
-        console.error('[REDIS-ERROR] Failed to get waiting users:', error);
-        return new Map();
-    }
-}
-
-// ==========================================
-// CONSTANTS
-// ==========================================
-
-const USER_TIMEOUT = 120000;
-const MATCH_LIFETIME = 600000;
+// Timezone scoring constants
 const TIMEZONE_MAX_SCORE = 20;
 const TIMEZONE_PENALTY = 1;
+const TIMEZONE_CIRCLE_HOURS = 24;
 
-// Pre-calculated tables
-let timezoneScoreTable = new Array(25);
-let genderScoreTable = new Map();
-let distanceCache = new Map();
+// Performance constants
+const INDEX_REBUILD_INTERVAL = 10000; // 10 seconds
+const MAX_CACHE_SIZE = 1000;
+const MATCH_CACHE_TTL = 5000; // 5 seconds
+const MAX_CANDIDATES = 5; // Reduced from 10
+
+// Adaptive strategy thresholds
+const SIMPLE_STRATEGY_THRESHOLD = 10;
+const HYBRID_STRATEGY_THRESHOLD = 100;
+
+// ==========================================
+// OPTIMIZED GLOBAL STATE
+// ==========================================
+
+let waitingUsers = new Map();
+let activeMatches = new Map();
+
+// 🔥 OPTIMIZATION: Multiple indexed data structures
+let timezoneIndex = new Map(); // timezone -> Set(userIds)
+let genderIndex = new Map();   // gender -> Set(userIds)
+let freshUsersSet = new Set(); // Users < 30s
+let lastIndexRebuild = 0;
+
+// 🔥 NEW: True incremental tracking
+let addedUsers = new Set();
+let removedUsers = new Map(); // userId -> user data for cleanup
+
+// 🔥 OPTIMIZATION: Pre-calculated distance cache
+let distanceCache = new Map(); // "zone1,zone2" -> circularDistance
+let timezoneScoreTable = new Array(25); // Pre-calculated scores 0-24
+let genderScoreTable = new Map(); // Pre-calculated gender combinations
+
+// ==========================================
+// LOGGING UTILITIES
+// ==========================================
+
+function smartLog(level, ...args) {
+    if (ENABLE_DETAILED_LOGGING) {
+        console.log(`[${level}]`, ...args);
+    }
+}
+
+function criticalLog(level, ...args) {
+    console.log(`[${level}]`, ...args);
+}
+
+// ==========================================
+// CORS & RESPONSE UTILITIES
+// ==========================================
+
+function createCorsResponse(data, status = 200) {
+    return new Response(data ? JSON.stringify(data) : null, {
+        status,
+        headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
+        }
+    });
+}
+
+// ==========================================
+// INITIALIZATION - PRE-CALCULATE TABLES
+// ==========================================
 
 function initializeOptimizations() {
+    // Pre-calculate timezone score table
     for (let distance = 0; distance <= 24; distance++) {
         timezoneScoreTable[distance] = Math.max(0, TIMEZONE_MAX_SCORE - (distance * TIMEZONE_PENALTY));
     }
     
+    // Pre-calculate gender score combinations
     const genders = ['Male', 'Female', 'Unspecified'];
     const genderCoeffs = { 'Male': 1, 'Female': -1, 'Unspecified': 0 };
     
@@ -392,14 +103,20 @@ function initializeOptimizations() {
         }
     }
     
-    console.log('[INIT] Optimization tables initialized');
+    criticalLog('INIT', 'Optimization tables initialized');
 }
 
+// Initialize on startup
 initializeOptimizations();
+
+// ==========================================
+// ULTRA-FAST DISTANCE CALCULATION WITH CACHE
+// ==========================================
 
 function getCircularDistance(zone1, zone2) {
     if (typeof zone1 !== 'number' || typeof zone2 !== 'number') return 12;
     
+    // Cache key (normalized)
     const cacheKey = zone1 <= zone2 ? `${zone1},${zone2}` : `${zone2},${zone1}`;
     
     if (distanceCache.has(cacheKey)) {
@@ -409,7 +126,8 @@ function getCircularDistance(zone1, zone2) {
     const linear = Math.abs(zone1 - zone2);
     const circular = linear > 12 ? 24 - linear : linear;
     
-    if (distanceCache.size >= 1000) {
+    // Add to cache with LRU eviction
+    if (distanceCache.size >= MAX_CACHE_SIZE) {
         const firstKey = distanceCache.keys().next().value;
         distanceCache.delete(firstKey);
     }
@@ -429,28 +147,172 @@ function getGenderScore(gender1, gender2) {
 }
 
 // ==========================================
-// MATCHING LOGIC
+// ✅ FIXED: REAL-TIME INDEX MANAGEMENT
 // ==========================================
 
-async function findSimpleMatch(userId, userChatZone, userGender) {
+// Helper: Add user to indexes - O(1)
+function addUserToIndexes(userId, user) {
+    // Timezone index
+    const zone = user.chatZone;
+    if (typeof zone === 'number') {
+        if (!timezoneIndex.has(zone)) {
+            timezoneIndex.set(zone, new Set());
+        }
+        timezoneIndex.get(zone).add(userId);
+    }
+    
+    // Gender index
+    const gender = user.userInfo?.gender || 'Unspecified';
+    if (!genderIndex.has(gender)) {
+        genderIndex.set(gender, new Set());
+    }
+    genderIndex.get(gender).add(userId);
+    
+    // Fresh users (< 30 seconds)
+    if (Date.now() - user.timestamp < 30000) {
+        freshUsersSet.add(userId);
+    }
+}
+
+// ✅ FIXED: Remove user from indexes with immediate cleanup
+function removeUserFromIndexes(userId, user) {
+    if (!user) return;
+    
+    // Timezone index
+    const zone = user.chatZone;
+    if (typeof zone === 'number' && timezoneIndex.has(zone)) {
+        timezoneIndex.get(zone).delete(userId);
+        // Cleanup empty sets
+        if (timezoneIndex.get(zone).size === 0) {
+            timezoneIndex.delete(zone);
+        }
+    }
+    
+    // Gender index
+    const gender = user.userInfo?.gender || 'Unspecified';
+    if (genderIndex.has(gender)) {
+        genderIndex.get(gender).delete(userId);
+        if (genderIndex.get(gender).size === 0) {
+            genderIndex.delete(gender);
+        }
+    }
+    
+    // Fresh users
+    freshUsersSet.delete(userId);
+}
+
+function buildIndexesIfNeeded() {
+    const now = Date.now();
+    
+    // Process incremental updates first
+    if (addedUsers.size > 0 || removedUsers.size > 0) {
+        updateIndexesIncrementally();
+        return;
+    }
+    
+    // Only rebuild if absolutely necessary
+    if (now - lastIndexRebuild < INDEX_REBUILD_INTERVAL && timezoneIndex.size > 0) {
+        return; // Skip rebuild
+    }
+    
+    // Full rebuild for initial setup or periodic refresh
+    buildIndexes();
+}
+
+function buildIndexes() {
+    const now = Date.now();
+    
+    // Clear indexes
+    timezoneIndex.clear();
+    genderIndex.clear();
+    freshUsersSet.clear();
+    
+    // Build new indexes in single pass
+    for (const [userId, user] of waitingUsers.entries()) {
+        addUserToIndexes(userId, user);
+    }
+    
+    lastIndexRebuild = now;
+    
+    smartLog('INDEX-REBUILD', `Indexes built: ${timezoneIndex.size} zones, ${genderIndex.size} genders, ${freshUsersSet.size} fresh`);
+}
+
+function updateIndexesIncrementally() {
+    // Process added users - O(k) where k = số users thay đổi
+    for (const userId of addedUsers) {
+        const user = waitingUsers.get(userId);
+        if (user) {
+            addUserToIndexes(userId, user);
+        }
+    }
+    
+    // Process removed users - O(k)
+    for (const [userId, userData] of removedUsers.entries()) {
+        removeUserFromIndexes(userId, userData);
+    }
+    
+    smartLog('INDEX-UPDATE', `Incremental update: ${addedUsers.size} added, ${removedUsers.size} removed`);
+    
+    // Clear change tracking
+    addedUsers.clear();
+    removedUsers.clear();
+}
+
+// ==========================================
+// ✅ FIXED: OPTIMIZED USER OPERATIONS
+// ==========================================
+
+function addWaitingUser(userId, userData) {
+    waitingUsers.set(userId, userData);
+    // Real-time index update for immediate availability
+    addUserToIndexes(userId, userData);
+    // Track for potential batch operations (optional)
+    addedUsers.add(userId);
+}
+
+// ✅ FIXED: Immediate index cleanup
+function removeWaitingUser(userId) {
+    const user = waitingUsers.get(userId);
+    if (user) {
+        // Remove from waitingUsers first
+        waitingUsers.delete(userId);
+        
+        // Immediate index cleanup (no more batch delays)
+        removeUserFromIndexes(userId, user);
+        
+        // Clean up tracking
+        addedUsers.delete(userId);
+        removedUsers.delete(userId);
+        
+        return true;
+    }
+    return false;
+}
+
+// ==========================================
+// ✅ FIXED: MATCHING STRATEGIES WITH SELF-EXCLUSION
+// ==========================================
+
+function findSimpleMatchExcludeSelf(userId, userChatZone, userGender) {
     let bestMatch = null;
     let bestScore = 0;
     
-    const waitingUsers = await getAllWaitingUsersFromRedis();
-    
     for (const [candidateId, candidate] of waitingUsers.entries()) {
-        if (candidateId === userId) continue;
+        if (candidateId === userId) continue; // ✅ Skip self
         
         let score = 1;
         
+        // Quick timezone score
         if (typeof userChatZone === 'number' && typeof candidate.chatZone === 'number') {
             const distance = getCircularDistance(userChatZone, candidate.chatZone);
             score += timezoneScoreTable[distance] || 0;
         }
         
+        // Quick gender score
         const candidateGender = candidate.userInfo?.gender || 'Unspecified';
         score += getGenderScore(userGender, candidateGender);
         
+        // Fresh bonus
         if (Date.now() - candidate.timestamp < 30000) {
             score += 2;
         }
@@ -460,182 +322,241 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
             bestMatch = { userId: candidateId, user: candidate, score };
         }
         
+        // Early exit for perfect matches
         if (score >= 25) break;
     }
     
     return bestMatch;
 }
 
+function findUltraFastMatchExcludeSelf(userId, userChatZone, userGender) {
+    buildIndexesIfNeeded();
+    
+    const now = Date.now();
+    let bestMatch = null;
+    let bestScore = 0;
+    
+    // 🔥 PRIORITY 1: Same timezone + fresh users (< 30s)
+    if (typeof userChatZone === 'number') {
+        const sameZoneCandidates = timezoneIndex.get(userChatZone);
+        if (sameZoneCandidates) {
+            for (const candidateId of sameZoneCandidates) {
+                if (candidateId === userId) continue; // ✅ Skip self
+                
+                const candidate = waitingUsers.get(candidateId);
+                if (!candidate) continue;
+                
+                let score = 21; // Base score for same timezone (20 + 1)
+                
+                // Gender bonus
+                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
+                score += getGenderScore(userGender, candidateGender);
+                
+                // Fresh user mega bonus
+                if (freshUsersSet.has(candidateId)) {
+                    score += 3;
+                }
+                
+                // 🚀 EARLY EXIT: Perfect fresh match
+                if (score >= 27) {
+                    return { userId: candidateId, user: candidate, score };
+                }
+                
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = { userId: candidateId, user: candidate, score };
+                }
+            }
+        }
+    }
+    
+    // 🔥 PRIORITY 2: Adjacent timezones (±1, ±2) - but only if no good same-zone match
+    if (bestScore < 23 && typeof userChatZone === 'number') {
+        const adjacentZones = [
+            userChatZone - 1, userChatZone + 1,  // ±1 hour
+            userChatZone - 2, userChatZone + 2   // ±2 hours
+        ];
+        
+        for (const adjZone of adjacentZones) {
+            const normalizedZone = ((adjZone + 12) % 24) - 12; // Handle wraparound
+            const adjCandidates = timezoneIndex.get(normalizedZone);
+            
+            if (!adjCandidates) continue;
+            
+            // Only check first 2 candidates from adjacent zones for speed
+            let checkedCount = 0;
+            for (const candidateId of adjCandidates) {
+                if (candidateId === userId || checkedCount >= 2) continue; // ✅ Skip self
+                checkedCount++;
+                
+                const candidate = waitingUsers.get(candidateId);
+                if (!candidate) continue;
+                
+                let score = 1 + getTimezoneScore(userChatZone, normalizedZone);
+                
+                // Gender bonus
+                const candidateGender = candidate.userInfo?.gender || 'Unspecified';
+                score += getGenderScore(userGender, candidateGender);
+                
+                // Fresh bonus
+                if (freshUsersSet.has(candidateId)) {
+                    score += 2;
+                }
+                
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = { userId: candidateId, user: candidate, score };
+                }
+            }
+        }
+    }
+    
+    // 🔥 PRIORITY 3: Any timezone - only if no decent match found
+    if (bestScore < 15) {
+        let checkedCount = 0;
+        for (const [candidateId, candidate] of waitingUsers.entries()) {
+            if (candidateId === userId || checkedCount >= 5) break; // ✅ Skip self
+            checkedCount++;
+            
+            let score = 1 + getTimezoneScore(userChatZone, candidate.chatZone);
+            
+            const candidateGender = candidate.userInfo?.gender || 'Unspecified';
+            score += getGenderScore(userGender, candidateGender);
+            
+            if (freshUsersSet.has(candidateId)) {
+                score += 1;
+            }
+            
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = { userId: candidateId, user: candidate, score };
+            }
+        }
+    }
+    
+    return bestMatch;
+}
+
+function findHybridMatchExcludeSelf(userId, userChatZone, userGender) {
+    // If small user count, use simple approach
+    if (waitingUsers.size <= 20) {
+        return findSimpleMatchExcludeSelf(userId, userChatZone, userGender);
+    }
+    
+    // If many null/undefined timezones, use simple approach
+    const validTimezoneUsers = Array.from(waitingUsers.values())
+        .filter(u => typeof u.chatZone === 'number').length;
+    
+    if (validTimezoneUsers < waitingUsers.size * 0.5) {
+        return findSimpleMatchExcludeSelf(userId, userChatZone, userGender);
+    }
+    
+    // Otherwise use optimized approach
+    buildIndexesIfNeeded();
+    return findUltraFastMatchExcludeSelf(userId, userChatZone, userGender);
+}
+
 // ==========================================
-// ✅ FIXED: NODE.JS REQUEST HANDLERS
+// ✅ FIXED: INSTANT MATCH HANDLER (NO RACE CONDITIONS)
 // ==========================================
 
- async function handleInstantMatch(userId, data) {
-    const { userInfo, preferredMatchId, chatZone, gender } = data;
+
+// ==========================================
+// ✅ FIXED: OTHER HANDLERS
+// ==========================================
+
+function handleGetSignals(userId, data) {
+    const { chatZone, gender, userInfo } = data;
     
-    // ✅ SỬA: Enhanced validation
-    if (!userId || typeof userId !== 'string') {
-        return {
-            statusCode: 400,
-            body: JSON.stringify({ 
-                error: 'userId is required and must be string',
-                received: { userId, type: typeof userId }
-            })
-        };
-    }
-    
-    // ✅ THÊM: Debug log
-    console.log(`[INSTANT-MATCH] ${userId.slice(-8)} looking for partner`, {
-        hasUserInfo: !!userInfo,
-        chatZone,
-        gender,
-        dataKeys: Object.keys(data)
-    });
-    
-    // Check if user already in a match
-    const waitingUsers = await getAllWaitingUsersFromRedis();
-    const userGender = gender || userInfo?.gender || 'Unspecified';
-    
-    const bestMatch = await findSimpleMatch(userId, chatZone, userGender);
-    
-    if (bestMatch) {
-        const partnerId = bestMatch.userId;
-        const partnerUser = bestMatch.user;
-        
-        // Remove both users from waiting list
-        await removeWaitingUserFromRedis(userId);
-        await removeWaitingUserFromRedis(partnerId);
-        
-        // Create match
-        const sortedUsers = [userId, partnerId].sort();
-        const matchId = `match_${sortedUsers[0]}_${sortedUsers[1]}`;        
-        const isUserInitiator = userId < partnerId;
-        const p1 = isUserInitiator ? userId : partnerId;
-        const p2 = isUserInitiator ? partnerId : userId;
-        
-        const match = {
-            p1, p2,
-            timestamp: Date.now(),
-            connected: false,
-            connectedAt: null,
-            signals: { [p1]: [], [p2]: [] },
-            userInfo: {
-                [userId]: userInfo || {},
-                [partnerId]: partnerUser.userInfo || {}
-            },
-            chatZones: {
-                [userId]: chatZone,
-                [partnerId]: partnerUser.chatZone
-            },
-            matchScore: bestMatch.score,
-            strategy: 'simple'
-        };
-        
-        await setMatch(matchId, match);
-        
-        console.log(`[INSTANT-MATCH] 🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
-        
-        return {
-            statusCode: 200,
-            body: JSON.stringify({
-                status: 'instant-match',
+    // Kiểm tra active matches trước
+    for (const [matchId, match] of activeMatches.entries()) {
+        if (match.p1 === userId || match.p2 === userId) {
+            const partnerId = match.p1 === userId ? match.p2 : match.p1;
+            const signals = match.signals[userId] || [];
+            
+            match.signals[userId] = [];
+            
+            smartLog('GET-SIGNALS', `${userId.slice(-8)} -> ${signals.length} signals`);
+            
+            return createCorsResponse({
+                status: 'matched',
                 matchId,
                 partnerId,
-                isInitiator: isUserInitiator,
-                partnerInfo: partnerUser.userInfo || {},
-                partnerChatZone: partnerUser.chatZone,
-                signals: [],
-                compatibility: bestMatch.score,
-                strategy: 'simple',
-                message: 'Instant match found! WebRTC connection will be established.',
+                isInitiator: match.p1 === userId,
+                signals,
+                partnerChatZone: match.chatZones ? match.chatZones[partnerId] : null,
+                matchScore: match.matchScore || null,
+                strategy: match.strategy || 'unknown',
                 timestamp: Date.now()
-            })
-        };
-        
-    } else {
-        // Add to waiting list
-        const waitingUser = {
-            userId,
-            userInfo: userInfo || {},
-            chatZone: chatZone || null,
+            });
+        }
+    }
+    
+    // ✅ Kiểm tra waiting list với auto-recovery
+    if (waitingUsers.has(userId)) {
+        const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
+        return createCorsResponse({
+            status: 'waiting',
+            position,
+            waitingUsers: waitingUsers.size,
+            chatZone: chatZone,
+            userGender: gender || 'Unspecified',
             timestamp: Date.now()
-        };
-        
-        await addWaitingUserToRedis(userId, waitingUser);
-        
-        const currentWaitingUsers = await getAllWaitingUsersFromRedis();
-        const position = Array.from(currentWaitingUsers.keys()).indexOf(userId) + 1;
-        
-        console.log(`[INSTANT-MATCH] ${userId.slice(-8)} added to waiting list (position: ${position})`);
-        
-        return {
-            statusCode: 200,
-            body: JSON.stringify({
-                status: 'waiting',
-                position: position || currentWaitingUsers.size,
-                waitingUsers: currentWaitingUsers.size,
+        });
+    } else {
+        // ✅ AUTO-RECOVERY: Tự động thêm lại user nếu có đủ thông tin
+        if (chatZone !== undefined) {
+            const waitingUser = {
+                userId,
+                userInfo: userInfo || {},
                 chatZone: chatZone,
-                userGender: userGender,
-                strategy: 'simple',
-                message: 'Added to matching queue. Waiting for partner...',
-                estimatedWaitTime: Math.min(currentWaitingUsers.size * 2, 30),
                 timestamp: Date.now()
-            })
-        };
+            };
+            
+            addWaitingUser(userId, waitingUser);
+            
+            smartLog('GET-SIGNALS', `${userId.slice(-8)} auto-recovered to waiting list`);
+            
+            return createCorsResponse({
+                status: 'waiting',
+                position: waitingUsers.size,
+                waitingUsers: waitingUsers.size,
+                chatZone: chatZone,
+                userGender: gender || 'Unspecified',
+                message: 'Auto-recovered to waiting list',
+                timestamp: Date.now()
+            });
+        }
     }
+    
+    return createCorsResponse({
+        status: 'not_found',
+        message: 'User not found in waiting list or active matches',
+        tip: 'Try calling instant-match first',
+        timestamp: Date.now()
+    });
 }
-async function handleSendSignal(userId, data) {
+
+function handleSendSignal(userId, data) {
     const { matchId, type, payload } = data;
-   console.log(`📤 [SIGNAL] ${userId.slice(-8)} sending ${type} to match ${matchId?.slice(-8)}`);
     
-    // ✅ Special logging for offer/answer
-    if (type === 'offer' || type === 'answer') {
-        console.log(`📤 [${type.toUpperCase()}] Received from ${userId.slice(-8)}`);
-        console.log(`📤 [${type.toUpperCase()}] SDP size: ${payload?.sdp?.length || 0} chars`);
-        console.log(`📤 [${type.toUpperCase()}] SDP preview: ${payload?.sdp?.substring(0, 100)}...`);
-        console.log(`📤 [${type.toUpperCase()}] Payload keys: ${Object.keys(payload || {})}`);
-    }
-    // ✅ SỬA: Enhanced validation
     if (!matchId || !type || !payload) {
-        return {
-            statusCode: 400,
-            body: JSON.stringify({ 
-                error: 'Missing required fields',
-                required: ['matchId', 'type', 'payload'],
-                received: {
-                    matchId: !!matchId,
-                    type: !!type,
-                    payload: !!payload,
-                    dataKeys: Object.keys(data)
-                }
-            })
-        };
+        return createCorsResponse({ 
+            error: 'Missing required fields',
+            required: ['matchId', 'type', 'payload']
+        }, 400);
     }
     
-    // ✅ THÊM: Debug log
-    console.log(`[SEND-SIGNAL] ${userId.slice(-8)} sending ${type} to match ${matchId.slice(-8)}`);
-    
-    const match = await getMatch(matchId);
+    const match = activeMatches.get(matchId);
     if (!match) {
-        return {
-            statusCode: 404,
-            body: JSON.stringify({ 
-                error: 'Match not found',
-                matchId,
-                tip: 'Match may have expired or been deleted'
-            })
-        };
+        return createCorsResponse({ 
+            error: 'Match not found',
+            matchId
+        }, 404);
     }
     
     if (match.p1 !== userId && match.p2 !== userId) {
-        return {
-            statusCode: 403,
-            body: JSON.stringify({ 
-                error: 'User not in this match',
-                userId: userId.slice(-8),
-                matchUsers: [match.p1.slice(-8), match.p2.slice(-8)]
-            })
-        };
+        return createCorsResponse({ error: 'User not in this match' }, 403);
     }
     
     const partnerId = match.p1 === userId ? match.p2 : match.p1;
@@ -656,353 +577,468 @@ async function handleSendSignal(userId, data) {
     // Limit queue size
     if (match.signals[partnerId].length > 100) {
         match.signals[partnerId] = match.signals[partnerId].slice(-50);
-        console.log(`[SEND-SIGNAL] Trimmed signal queue for ${partnerId.slice(-8)}`);
     }
     
-    await setMatch(matchId, match);
+    smartLog('SEND-SIGNAL', `${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type})`);
     
-    console.log(`[SEND-SIGNAL] ✅ ${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type}) | Queue: ${match.signals[partnerId].length}`);
-    
-    return {
-        statusCode: 200,
-        body: JSON.stringify({
-            status: 'sent',
-            partnerId,
-            signalType: type,
-            queueLength: match.signals[partnerId].length,
-            timestamp: Date.now()
-        })
-    };
+    return createCorsResponse({
+        status: 'sent',
+        partnerId,
+        signalType: type,
+        queueLength: match.signals[partnerId].length,
+        timestamp: Date.now()
+    });
 }
-async function handleGetSignals(userId, data) {
-    const { chatZone, gender, userInfo } = data;
+
+function handleP2pConnected(userId, data) {
+    const { matchId, partnerId } = data;
+    criticalLog('P2P-CONNECTED', `${matchId} - ${userId.slice(-8)} connected`);
     
-    // ✅ THÊM: Debug log
-    console.log(`[GET-SIGNALS] ${userId.slice(-8)} checking for signals/matches`);
+    let removed = false;
     
-    try {
-        // Check all active matches for this user
-        const redis = await getRedisClient();
-        const matchKeys = await redis.keys('match:*');
-        
-        for (const key of matchKeys) {
-            const matchId = key.replace('match:', '');
-            const match = await getMatch(matchId);
+    // ✅ FIX: CHỈ xóa khỏi waiting list
+    if (removeWaitingUser(userId)) removed = true;
+    if (removeWaitingUser(partnerId)) removed = true;
+    
+    // ✅ FIX: KHÔNG xóa match, chỉ đánh dấu là connected
+    const match = activeMatches.get(matchId);
+    if (match) {
+        match.connected = true;
+        match.connectedAt = Date.now();
+        criticalLog('P2P-CONNECTED', `Match ${matchId} marked as connected`);
+    } else {
+        criticalLog('P2P-CONNECTED', `Match ${matchId} not found (may have been cleaned up)`);
+    }
+    
+    // ❌ REMOVED: activeMatches.delete(matchId);
+    
+    return createCorsResponse({
+        status: 'p2p_connected',
+        removed,
+        matchPreserved: !!match,
+        timestamp: Date.now()
+    });
+}
+
+function handleDisconnect(userId) {
+    criticalLog('DISCONNECT', userId.slice(-8));
+    
+    let removed = false;
+    
+    // Use optimized removal
+    if (removeWaitingUser(userId)) removed = true;
+    
+    // ✅ FIX: Better match cleanup on disconnect
+    for (const [matchId, match] of activeMatches.entries()) {
+        if (match.p1 === userId || match.p2 === userId) {
+            const partnerId = match.p1 === userId ? match.p2 : match.p1;
             
-            if (match && (match.p1 === userId || match.p2 === userId)) {
-                const partnerId = match.p1 === userId ? match.p2 : match.p1;
-                const signals = match.signals[userId] || [];
-                
-                // Clear signals after reading
-                match.signals[userId] = [];
-                await setMatch(matchId, match);
-                
-                console.log(`[GET-SIGNALS] ✅ ${userId.slice(-8)} found match ${matchId.slice(-8)} with ${signals.length} signals`);
-                
-                return {
-                    statusCode: 200,
-                    body: JSON.stringify({
-                        status: 'matched',
-                        matchId,
-                        partnerId,
-                        isInitiator: match.p1 === userId,
-                        signals,
-                        partnerChatZone: match.chatZones ? match.chatZones[partnerId] : null,
-                        matchScore: match.matchScore || null,
-                        strategy: match.strategy || 'simple',
-                        timestamp: Date.now()
-                    })
-                };
-            }
-        }
-        
-        // If no active match, check waiting list
-        const waitingUsers = await getAllWaitingUsersFromRedis();
-        
-        if (waitingUsers.has(userId)) {
-            const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
-            
-            console.log(`[GET-SIGNALS] ${userId.slice(-8)} waiting in position ${position}`);
-            
-            return {
-                statusCode: 200,
-                body: JSON.stringify({
-                    status: 'waiting',
-                    position,
-                    waitingUsers: waitingUsers.size,
-                    chatZone: chatZone,
-                    userGender: gender || 'Unspecified',
+            // Send disconnect signal to partner
+            if (match.signals && match.signals[partnerId]) {
+                match.signals[partnerId].push({
+                    type: 'disconnect',
+                    payload: { reason: 'partner_disconnected' },
+                    from: userId,
                     timestamp: Date.now()
-                })
-            };
+                });
+            }
+            
+            // ✅ FIX: Mark match as disconnected instead of immediate deletion
+            match.disconnected = true;
+            match.disconnectedAt = Date.now();
+            match.disconnectedBy = userId;
+            
+            // ✅ DELETE after a short delay to allow partner to receive disconnect signal
+            setTimeout(() => {
+                activeMatches.delete(matchId);
+                criticalLog('DISCONNECT', `Delayed removal of match ${matchId}`);
+            }, 5000); // 5 second delay
+            
+            criticalLog('DISCONNECT', `Match ${matchId} marked for removal`);
+            removed = true;
+            break;
+        }
+    }
+    
+    return createCorsResponse({ 
+        status: 'disconnected',
+        removed,
+        timestamp: Date.now()
+    });
+}
+
+// ==========================================
+// OPTIMIZED CLEANUP
+// ==========================================
+function cleanup() {
+    const now = Date.now();
+    let cleanedUsers = 0;
+    let cleanedMatches = 0;
+    
+    // ✅ TIMEOUTS - Phân biệt signaling và connected
+    const SIGNALING_TIMEOUT = 120000;  // 2 phút cho signaling exchange
+    const CONNECTED_TIMEOUT = 300000;  // 5 phút sau khi P2P connected
+    const USER_TIMEOUT = 120000;       // 2 phút cho waiting users
+    
+    // Batch cleanup - collect expired IDs first
+    const expiredUsers = [];
+    for (const [userId, user] of waitingUsers.entries()) {
+        if (now - user.timestamp > USER_TIMEOUT) {
+            expiredUsers.push(userId);
+        }
+    }
+    
+    // ✅ FIX: Smart match cleanup based on connection status
+    const expiredMatches = [];
+    for (const [matchId, match] of activeMatches.entries()) {
+        const age = now - match.timestamp;
+        
+        if (!match.connected) {
+            // ✅ Match chưa connected - chỉ xóa sau 2 phút signaling
+            if (age > SIGNALING_TIMEOUT) {
+                // expiredMatches.push(matchId);
+                criticalLog('CLEANUP', `Expired signaling match: ${matchId} (${Math.round(age/1000)}s old)`);
+            }
         } else {
-            // ✅ AUTO-RECOVERY: Add user back to waiting list if they have valid data
-            if (chatZone !== undefined) {
-                const waitingUser = {
-                    userId,
-                    userInfo: userInfo || {},
-                    chatZone: chatZone,
-                    timestamp: Date.now()
-                };
-                
-                await addWaitingUserToRedis(userId, waitingUser);
-                const currentWaitingUsers = await getAllWaitingUsersFromRedis();
-                
-                console.log(`[GET-SIGNALS] ${userId.slice(-8)} auto-recovered to waiting list`);
-                
-                return {
-                    statusCode: 200,
-                    body: JSON.stringify({
-                        status: 'waiting',
-                        position: currentWaitingUsers.size,
-                        waitingUsers: currentWaitingUsers.size,
-                        chatZone: chatZone,
-                        userGender: gender || 'Unspecified',
-                        message: 'Auto-recovered to waiting list',
-                        timestamp: Date.now()
-                    })
-                };
+            // ✅ Match đã connected - xóa sau 5 phút connected
+            const connectedAge = now - match.connectedAt;
+            if (connectedAge > CONNECTED_TIMEOUT) {
+                // expiredMatches.push(matchId);
+                criticalLog('CLEANUP', `Expired connected match: ${matchId} (connected ${Math.round(connectedAge/1000)}s ago)`);
             }
         }
+    }
+    
+    // Batch delete using optimized removal
+    expiredUsers.forEach(userId => {
+        if (removeWaitingUser(userId)) cleanedUsers++;
+    });
+    
+    expiredMatches.forEach(matchId => {
+        activeMatches.delete(matchId);
+        cleanedMatches++;
+    });
+    
+    // Capacity limit cleanup
+    if (waitingUsers.size > MAX_WAITING_USERS) {
+        const excess = waitingUsers.size - MAX_WAITING_USERS;
+        const oldestUsers = Array.from(waitingUsers.entries())
+            .sort((a, b) => a[1].timestamp - b[1].timestamp)
+            .slice(0, excess)
+            .map(entry => entry[0]);
         
-        return {
-            statusCode: 404,
-            body: JSON.stringify({
-                status: 'not_found',
-                message: 'User not found in waiting list or active matches',
-                tip: 'Try calling instant-match first',
-                timestamp: Date.now()
-            })
-        };
-        
-    } catch (error) {
-        console.error(`[GET-SIGNALS-ERROR] ${userId.slice(-8)}:`, error.message);
-        
-        return {
-            statusCode: 500,
-            body: JSON.stringify({
-                error: 'Failed to get signals',
-                message: error.message,
-                timestamp: Date.now()
-            })
-        };
+        oldestUsers.forEach(userId => {
+            if (removeWaitingUser(userId)) cleanedUsers++;
+        });
+    }
+    
+    if (cleanedUsers > 0 || cleanedMatches > 0) {
+        criticalLog('CLEANUP', `Removed ${cleanedUsers} users, ${cleanedMatches} matches. Active: ${waitingUsers.size} waiting, ${activeMatches.size} matched`);
     }
 }
-async function handler(req, res) {
+
+// ==========================================
+// 3. ✅ FIXED: handleInstantMatch - Ensure match object has proper structure
+// ==========================================
+
+function handleInstantMatch(userId, data) {
+    const { userInfo, preferredMatchId, chatZone, gender } = data;
+    
+    // MINIMAL VALIDATION - NO chatZone validation to avoid 400 error
+    if (!userId || typeof userId !== 'string') {
+        return createCorsResponse({ error: 'userId is required and must be string' }, 400);
+    }
+    
+    smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
+    
+    // ✅ KIỂM TRA ACTIVE MATCHES TRƯỚC - không thay đổi
+    for (const [matchId, match] of activeMatches.entries()) {
+        if (match.p1 === userId || match.p2 === userId) {
+            const partnerId = match.p1 === userId ? match.p2 : match.p1;
+            return createCorsResponse({
+                status: 'already-matched',
+                matchId,
+                partnerId,
+                isInitiator: match.p1 === userId,
+                message: 'User already in active match',
+                timestamp: Date.now()
+            });
+        }
+    }
+    
+    // 🔧 ADAPTIVE MATCHING STRATEGY
+    const userGender = gender || userInfo?.gender || 'Unspecified';
     const startTime = Date.now();
     
-    // ✅ THÊM: Global timeout protection
-    const globalTimeout = setTimeout(() => {
-        if (!res.headersSent) {
-            console.error('[GLOBAL-TIMEOUT] Function timeout after 25s');
-            res.status(408).json({
-                error: 'Function timeout',
-                message: 'Request took too long to process'
-            });
-        }
-    }, 25000); // 25 seconds
+    let bestMatch;
+    let strategy;
     
-    try {
-        // CORS headers
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
+        bestMatch = findSimpleMatchExcludeSelf(userId, chatZone, userGender);
+        strategy = 'simple';
+    } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
+        bestMatch = findHybridMatchExcludeSelf(userId, chatZone, userGender);
+        strategy = 'hybrid';
+    } else {
+        buildIndexesIfNeeded();
+        bestMatch = findUltraFastMatchExcludeSelf(userId, chatZone, userGender);
+        strategy = 'optimized';
+    }
+    
+    if (bestMatch) {
+        const partnerId = bestMatch.userId;
+        const partnerUser = bestMatch.user;
         
-        if (req.method === 'OPTIONS') {
-            clearTimeout(globalTimeout);
-            res.status(200).end();
-            return;
+        // ✅ FIX: CHỈ xóa cả 2 users KHI tìm thấy match
+        removeWaitingUser(userId);
+        removeWaitingUser(partnerId);
+        
+        // Create match
+        const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+        
+        const isUserInitiator = userId < partnerId;
+        const p1 = isUserInitiator ? userId : partnerId;
+        const p2 = isUserInitiator ? partnerId : userId;
+        
+        // ✅ FIX: Enhanced match object with connection tracking
+        const match = {
+            p1, p2,
+            timestamp: Date.now(),
+            connected: false,           // ✅ NEW: Track connection status
+            connectedAt: null,          // ✅ NEW: Track when P2P connected
+            signals: { [p1]: [], [p2]: [] },
+            userInfo: {
+                [userId]: userInfo || {},
+                [partnerId]: partnerUser.userInfo || {}
+            },
+            chatZones: {
+                [userId]: chatZone,
+                [partnerId]: partnerUser.chatZone
+            },
+            matchScore: bestMatch.score,
+            strategy: strategy
+        };
+        
+        activeMatches.set(matchId, match);
+        
+        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score} | Strategy: ${strategy}`);
+        
+        return createCorsResponse({
+            status: 'instant-match',
+            matchId,
+            partnerId,
+            isInitiator: isUserInitiator,
+            partnerInfo: partnerUser.userInfo || {},
+            partnerChatZone: partnerUser.chatZone,
+            signals: [],
+            compatibility: bestMatch.score,
+            strategy: strategy,
+            message: 'Instant match found! WebRTC connection will be established.',
+            timestamp: Date.now()
+        });
+        
+    } else {
+        // ✅ FIX: Thêm hoặc update user trong waiting list
+        const waitingUser = {
+            userId,
+            userInfo: userInfo || {},
+            chatZone: chatZone || null,
+            timestamp: Date.now()
+        };
+        
+        // Kiểm tra xem user đã có trong waiting list chưa
+        if (waitingUsers.has(userId)) {
+            // Update thông tin user hiện tại
+            const existingUser = waitingUsers.get(userId);
+            existingUser.userInfo = userInfo || existingUser.userInfo || {};
+            existingUser.chatZone = chatZone !== undefined ? chatZone : existingUser.chatZone;
+            existingUser.timestamp = Date.now(); // Update timestamp
+            
+            // Update indexes if needed
+            removeUserFromIndexes(userId, existingUser);
+            addUserToIndexes(userId, existingUser);
+            
+            smartLog('INSTANT-MATCH', `${userId.slice(-8)} updated in waiting list`);
+        } else {
+            // Thêm user mới vào waiting list
+            addWaitingUser(userId, waitingUser);
+            smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list`);
         }
         
-        if (req.method === 'GET') {
-            clearTimeout(globalTimeout);
-            
-            const debug = req.query.debug;
-            
-            if (debug === 'true') {
-                try {
-                    const waitingUsers = await getAllWaitingUsersFromRedis();
-                    
-                    res.status(200).json({
-                        status: 'redis-integrated-webrtc-signaling',
-                        runtime: 'nodejs18.x',
-                        version: '3.2-redis-nodejs-fixed',
-                        storage: 'Redis Labs',
-                        fixes: [
-                            'Node.js runtime compatibility',
-                            'Redis Labs integration', 
-                            'Fixed request body parsing',
-                            'Added timeout protection',
-                            'Memory usage optimization'
-                        ],
-                        stats: {
-                            waitingUsers: waitingUsers.size,
-                            redisConnected: !!redisClient
-                        },
-                        timestamp: Date.now()
-                    });
-                } catch (error) {
-                    res.status(200).json({
-                        status: 'redis-signaling-ready-debug-error',
-                        error: error.message,
-                        redisConnected: !!redisClient,
-                        timestamp: Date.now()
-                    });
-                }
-                return;
-            }
-            
-            res.status(200).json({ 
-                status: 'redis-nodejs-signaling-ready',
-                message: 'Redis + Node.js WebRTC signaling server ready!',
+        const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
+        
+        return createCorsResponse({
+            status: 'waiting',
+            position,
+            waitingUsers: waitingUsers.size,
+            chatZone: chatZone,
+            userGender: userGender,
+            strategy: strategy || 'simple',
+            message: 'Added to matching queue. Waiting for partner...',
+            estimatedWaitTime: Math.min(waitingUsers.size * 2, 30),
+            timestamp: Date.now()
+        });
+    }
+}
+
+
+// ==========================================
+// ✅ FIXED: REQUEST BODY PARSING FOR VERCEL EDGE
+// ==========================================
+
+async function parseRequestBody(request) {
+    try {
+        // Method 1: Try built-in json() method first (most reliable for Vercel Edge)
+        if (request.headers.get('content-type')?.includes('application/json')) {
+            return await request.json();
+        }
+        
+        // Method 2: Handle text/plain body (fallback)
+        const textBody = await request.text();
+        
+        if (!textBody || !textBody.trim()) {
+            throw new Error('Empty request body');
+        }
+        
+        // Try to parse as JSON
+        try {
+            return JSON.parse(textBody);
+        } catch (parseError) {
+            throw new Error(`Invalid JSON: ${parseError.message}`);
+        }
+        
+    } catch (error) {
+        throw new Error(`Body parsing failed: ${error.message}`);
+    }
+}
+
+// ==========================================
+// MAIN HANDLER FUNCTION - VERCEL EDGE OPTIMIZED
+// ==========================================
+
+export default async function handler(request) {
+    // Quick cleanup at start to prevent timeouts
+    const startTime = Date.now();
+    cleanup();
+    
+    if (request.method === 'OPTIONS') {
+        return createCorsResponse(null, 200);
+    }
+    
+    if (request.method === 'GET') {
+        const url = new URL(request.url);
+        const debug = url.searchParams.get('debug');
+        
+        if (debug === 'true') {
+            return createCorsResponse({
+                status: 'hybrid-optimized-webrtc-signaling-vercel-fixed',
+                runtime: 'vercel-edge',
+                version: '2.1-vercel-fixed',
+                strategies: {
+                    simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
+                    hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
+                    optimized: `>${HYBRID_STRATEGY_THRESHOLD} users`
+                },
+                fixes: [
+                    'Vercel Edge Runtime compatible request body parsing',
+                    'Timeout prevention with fast cleanup',
+                    'Race condition eliminated in instant-match',
+                    'Real-time index synchronization',
+                    'Auto-recovery in get-signals',
+                    'Self-exclusion in all matching strategies'
+                ],
+                stats: {
+                    waitingUsers: waitingUsers.size,
+                    activeMatches: activeMatches.size,
+                    cacheSize: distanceCache.size,
+                    indexStats: {
+                        timezones: timezoneIndex.size,
+                        genders: genderIndex.size,
+                        freshUsers: freshUsersSet.size,
+                        lastRebuild: Date.now() - lastIndexRebuild,
+                        pendingAdds: addedUsers.size,
+                        pendingRemoves: removedUsers.size
+                    }
+                },
+                performance: {
+                    startupTime: Date.now() - startTime
+                },
                 timestamp: Date.now()
             });
-            return;
         }
         
-        if (req.method !== 'POST') {
-            clearTimeout(globalTimeout);
-            res.status(405).json({ error: 'POST required for signaling' });
-            return;
-        }
+        return createCorsResponse({ 
+            status: 'hybrid-optimized-signaling-vercel-ready',
+            runtime: 'vercel-edge',
+            version: '2.1-vercel-fixed',
+            stats: { 
+                waiting: waitingUsers.size, 
+                matches: activeMatches.size,
+                strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
+                         waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
+            },
+            message: 'Vercel Edge optimized WebRTC signaling server ready!',
+            timestamp: Date.now()
+        });
+    }
+    
+    if (request.method !== 'POST') {
+        return createCorsResponse({ error: 'POST required for signaling' }, 405);
+    }
+    
+    try {
+        // ✅ FIXED: Vercel Edge compatible body parsing
+        const data = await parseRequestBody(request);
         
-        // ✅ THÊM: Quick timeout check
-        if (Date.now() - startTime > 20000) {
-            clearTimeout(globalTimeout);
-            res.status(408).json({
-                error: 'Processing timeout',
-                message: 'Request took too long'
-            });
-            return;
-        }
-        
-        // Parse body with timeout
-        const data = await parseNodeJSBody(req);
         const { action, userId } = data;
-        
-        // ✅ THÊM: Quick validation
-        if (!action) {
-            clearTimeout(globalTimeout);
-            console.log('[DEBUG] Missing action. Received:', Object.keys(data));
-            res.status(400).json({
-                error: 'Missing action field',
-                received: Object.keys(data || {}),
-                tip: 'action field is required'
-            });
-            return;
-        }
-        
-        if (!userId) {
-            clearTimeout(globalTimeout);
-            res.status(400).json({
-                error: 'Missing userId field',
-                tip: 'userId field is required'
-            });
-            return;
-        }
-        
-        // ✅ THÊM: Timeout check before processing
-        if (Date.now() - startTime > 22000) {
-            clearTimeout(globalTimeout);
-            res.status(408).json({
-                error: 'Pre-processing timeout',
-                message: 'Not enough time to process'
-            });
-            return;
-        }
-        
-        // Handle actions with individual timeouts
-        let result;
-        
-        try {
-            switch (action) {
-                case 'instant-match':
-                    result = await Promise.race([
-                        handleInstantMatch(userId, data),
-                        new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('instant-match timeout')), 8000)
-                        )
-                    ]);
-                    break;
-                case 'send-signal':
-                    result = await Promise.race([
-                        handleSendSignal(userId, data),
-                        new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('send-signal timeout')), 5000)
-                        )
-                    ]);
-                    break;
-                case 'get-signals':
-                    result = await Promise.race([
-                        handleGetSignals(userId, data),
-                        new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('get-signals timeout')), 5000)
-                        )
-                    ]);
-                    break;
-                case 'p2p-connected':
-                    result = await Promise.race([
-                        handleP2pConnected(userId, data),
-                        new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('p2p-connected timeout')), 3000)
-                        )
-                    ]);
-                    break;
-                case 'disconnect':
-                    result = await Promise.race([
-                        handleDisconnect(userId),
-                        new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('disconnect timeout')), 3000)
-                        )
-                    ]);
-                    break;
-                default:
-                    result = {
-                        statusCode: 400,
-                        body: JSON.stringify({
-                            error: 'Unknown action',
-                            received: action,
-                            available: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect']
-                        })
-                    };
-            }
-        } catch (actionError) {
-            console.error(`[ACTION-ERROR] ${action}:`, actionError.message);
-            result = {
-                statusCode: 500,
-                body: JSON.stringify({
-                    error: `Action ${action} failed`,
-                    message: actionError.message,
-                    timeout: actionError.message.includes('timeout')
-                })
-            };
+
+        if (!action || !userId) {
+            return createCorsResponse({
+                error: 'Missing required fields',
+                required: ['action', 'userId'],
+                received: Object.keys(data || {})
+            }, 400);
         }
 
-        clearTimeout(globalTimeout);
-        
-        if (!res.headersSent) {
-            res.status(result.statusCode).json(JSON.parse(result.body));
+        // Quick timeout check
+        if (Date.now() - startTime > 55000) { // 55 seconds safety margin
+            criticalLog('TIMEOUT-WARNING', `Request taking too long: ${Date.now() - startTime}ms`);
+            return createCorsResponse({
+                error: 'Request timeout prevention',
+                message: 'Please retry your request'
+            }, 408);
+        }
+
+        // Handle different actions with timeout protection
+        switch (action) {
+            case 'instant-match':
+                return handleInstantMatch(userId, data);
+            case 'get-signals':
+                return handleGetSignals(userId, data);
+            case 'send-signal':
+                return handleSendSignal(userId, data);
+            case 'p2p-connected':
+                return handleP2pConnected(userId, data);
+            case 'disconnect':
+                return handleDisconnect(userId);
+            default:
+                return createCorsResponse({
+                    error: 'Unknown action',
+                    received: action,
+                    available: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect']
+                }, 400);
         }
 
     } catch (error) {
-        clearTimeout(globalTimeout);
-        console.error('[MAIN-ERROR]', error.message);
+        criticalLog('ERROR', `Server error: ${error.message}`);
         
-        if (!res.headersSent) {
-            if (error.message.includes('timeout') || error.message.includes('Body too large')) {
-                res.status(408).json({
-                    error: 'Request timeout or too large',
-                    message: error.message,
-                    processing_time: Date.now() - startTime
-                });
-            } else {
-                res.status(500).json({
-                    error: 'Server error',
-                    message: error.message,
-                    processing_time: Date.now() - startTime
-                });
-            }
-        }
+        // Enhanced error response for debugging
+        return createCorsResponse({
+            error: 'Internal server error',
+            message: error.message,
+            type: error.constructor.name,
+            processing_time: Date.now() - startTime,
+            tip: 'Check request format and try again'
+        }, 500);
     }
 }
-module.exports = handler;
