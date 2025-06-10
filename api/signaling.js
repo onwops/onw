@@ -1,5 +1,5 @@
 // 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - VERCEL EDGE FIXED
-
+console.log(`DEPLOY` );
 const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
