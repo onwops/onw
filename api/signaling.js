@@ -9,46 +9,80 @@ const ENABLE_DETAILED_LOGGING = false;
 // ==========================================
 
 let redisClient = null;
+// ✅ ROBUST parseNodeJSBody for large SDP payloads
 async function parseNodeJSBody(req) {
     return new Promise((resolve, reject) => {
-        let body = '';
-        let size = 0;
-        const maxSize = 1024 * 1024; // 1MB limit
+        const chunks = [];
+        let totalSize = 0;
+        const maxSize = 10 * 1024 * 1024; // 10MB limit
         
         const timeout = setTimeout(() => {
             reject(new Error('Request body parsing timeout'));
-        }, 10000);
+        }, 15000); // 15s timeout for large SDP
         
         req.on('data', (chunk) => {
-            size += chunk.length;
+            totalSize += chunk.length;
             
-            if (size > maxSize) {
+            if (totalSize > maxSize) {
                 clearTimeout(timeout);
                 reject(new Error('Request body too large'));
                 return;
             }
             
-            body += chunk.toString();
+            chunks.push(chunk);
+            console.log(`📦 Chunk received: ${chunk.length} bytes (total: ${totalSize})`);
         });
         
         req.on('end', () => {
             clearTimeout(timeout);
+            
             try {
+                // ✅ CRITICAL: Proper Buffer concatenation
+                const body = Buffer.concat(chunks).toString('utf8');
+                console.log(`📦 Full body assembled: ${body.length} chars`);
+                
                 if (!body.trim()) {
                     reject(new Error('Empty request body'));
                     return;
                 }
                 
+                // ✅ Validate JSON structure before parsing
+                if (!body.startsWith('{') || !body.endsWith('}')) {
+                    console.error('❌ Invalid JSON structure:', {
+                        starts: body.substring(0, 50),
+                        ends: body.substring(body.length - 50)
+                    });
+                    reject(new Error('Invalid JSON structure'));
+                    return;
+                }
+                
                 const parsed = JSON.parse(body);
+                
+                // ✅ Log SDP size for debugging
+                if (parsed.payload && parsed.payload.sdp) {
+                    console.log(`📦 SDP size: ${parsed.payload.sdp.length} chars`);
+                }
+                
                 resolve(parsed);
+                
             } catch (error) {
+                console.error('❌ JSON parse error:', error.message);
+                console.error('Body preview:', body ? body.substring(0, 200) + '...' : 'null');
+                console.error('Body suffix:', body ? '...' + body.substring(body.length - 200) : 'null');
                 reject(new Error(`JSON parse error: ${error.message}`));
             }
         });
         
         req.on('error', (error) => {
             clearTimeout(timeout);
+            console.error('❌ Stream error:', error);
             reject(new Error(`Stream error: ${error.message}`));
+        });
+        
+        // ✅ Handle connection issues
+        req.on('close', () => {
+            clearTimeout(timeout);
+            console.log('📦 Request connection closed');
         });
     });
 }
