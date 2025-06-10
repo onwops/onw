@@ -9,6 +9,9 @@
     "start": "vercel dev",
     "deploy": "vercel --prod"
   },
+  "dependencies": {
+    "redis": "^4.6.10"
+  },
   "engines": {
     "node": ">=18.0.0"
   },
