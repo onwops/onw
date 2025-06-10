@@ -281,7 +281,6 @@ function removeWaitingUser(userId) {
         // Store user data for cleanup
         removedUsers.set(userId, user);
         // Real-time index cleanup
-        removeUserFromIndexes(userId, user);
         waitingUsers.delete(userId);
         return true;
     }
