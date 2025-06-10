@@ -352,7 +352,7 @@ async function handleInstantMatch(userId, data) {
 
 async function handleSendSignal(userId, data) {
     const { matchId, type, payload } = data;
-    
+    /*
     if (!matchId || !type || !payload) {
         return {
             statusCode: 400,
@@ -362,7 +362,7 @@ async function handleSendSignal(userId, data) {
             })
         };
     }
-    
+    */
     const match = await getMatch(matchId);
     if (!match) {
         return {
