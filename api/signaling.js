@@ -281,7 +281,6 @@ function removeWaitingUser(userId) {
         // Store user data for cleanup
         removedUsers.set(userId, user);
         // Real-time index cleanup
-        removeUserFromIndexes(userId, user);
         waitingUsers.delete(userId);
         return true;
     }
@@ -470,11 +469,18 @@ function handleInstantMatch(userId, data) {
     
     smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
     
-    // Remove from active matches first
-    for (const [matchId, match] of activeMatches.entries()) {
+ for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
-            activeMatches.delete(matchId);
-            break;
+            // ✅ TRẢ VỀ MATCH HIỆN TẠI thay vì xóa
+            const partnerId = match.p1 === userId ? match.p2 : match.p1;
+            return createCorsResponse({
+                status: 'already-matched',
+                matchId,
+                partnerId,
+                isInitiator: match.p1 === userId,
+                message: 'User already in active match',
+                timestamp: Date.now()
+            });
         }
     }
     
