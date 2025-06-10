@@ -10,79 +10,102 @@ const ENABLE_DETAILED_LOGGING = false;
 
 let redisClient = null;
 // ✅ ROBUST parseNodeJSBody for large SDP payloads
+// ✅ Enhanced parseNodeJSBody to handle both text/plain and application/json
 async function parseNodeJSBody(req) {
     return new Promise((resolve, reject) => {
         const chunks = [];
         let totalSize = 0;
         const maxSize = 10 * 1024 * 1024; // 10MB limit
         
+        // ✅ Detect Content-Type
+        const contentType = req.headers['content-type'] || 'text/plain';
+        console.log(`📦 [PARSE] Content-Type: ${contentType}`);
+        
         const timeout = setTimeout(() => {
+            console.error('❌ [PARSE] Request body parsing timeout after 15s');
             reject(new Error('Request body parsing timeout'));
-        }, 15000); // 15s timeout for large SDP
+        }, 15000); // Increased timeout for large payloads
         
         req.on('data', (chunk) => {
             totalSize += chunk.length;
             
             if (totalSize > maxSize) {
                 clearTimeout(timeout);
+                console.error(`❌ [PARSE] Request body too large: ${totalSize} bytes`);
                 reject(new Error('Request body too large'));
                 return;
             }
             
             chunks.push(chunk);
-            console.log(`📦 Chunk received: ${chunk.length} bytes (total: ${totalSize})`);
+            console.log(`📦 [PARSE] Chunk received: ${chunk.length} bytes (total: ${totalSize})`);
         });
         
         req.on('end', () => {
             clearTimeout(timeout);
             
             try {
-                // ✅ CRITICAL: Proper Buffer concatenation
+                // ✅ Proper Buffer concatenation
                 const body = Buffer.concat(chunks).toString('utf8');
-                console.log(`📦 Full body assembled: ${body.length} chars`);
+                console.log(`📦 [PARSE] Body assembled: ${body.length} chars`);
+                console.log(`📦 [PARSE] Body preview: ${body.substring(0, 200)}...`);
                 
                 if (!body.trim()) {
+                    console.error('❌ [PARSE] Empty request body');
                     reject(new Error('Empty request body'));
                     return;
                 }
                 
-                // ✅ Validate JSON structure before parsing
-                if (!body.startsWith('{') || !body.endsWith('}')) {
-                    console.error('❌ Invalid JSON structure:', {
-                        starts: body.substring(0, 50),
-                        ends: body.substring(body.length - 50)
-                    });
-                    reject(new Error('Invalid JSON structure'));
-                    return;
+                // ✅ Handle different content types
+                let parsed;
+                
+                if (contentType.includes('application/json')) {
+                    console.log('📦 [PARSE] Parsing as JSON (application/json)');
+                    parsed = JSON.parse(body);
+                } else if (contentType.includes('text/plain')) {
+                    console.log('📦 [PARSE] Parsing as JSON from text/plain');
+                    // Validate JSON structure first
+                    if (!body.startsWith('{') || !body.endsWith('}')) {
+                        console.error('❌ [PARSE] Invalid JSON structure in text/plain:', {
+                            starts: body.substring(0, 50),
+                            ends: body.substring(body.length - 50)
+                        });
+                        reject(new Error('Invalid JSON structure in text/plain'));
+                        return;
+                    }
+                    parsed = JSON.parse(body);
+                } else {
+                    // Fallback: try to parse as JSON anyway
+                    console.log(`📦 [PARSE] Unknown content-type ${contentType}, attempting JSON parse`);
+                    parsed = JSON.parse(body);
                 }
                 
-                const parsed = JSON.parse(body);
+                console.log(`✅ [PARSE] Successfully parsed ${contentType}, action: ${parsed.action}`);
                 
-                // ✅ Log SDP size for debugging
-                if (parsed.payload && parsed.payload.sdp) {
-                    console.log(`📦 SDP size: ${parsed.payload.sdp.length} chars`);
+                // ✅ Enhanced logging for specific actions
+                if (parsed.action === 'send-signal' && parsed.payload?.sdp) {
+                    console.log(`📦 [PARSE] SDP signal detected: ${parsed.type}, SDP size: ${parsed.payload.sdp.length}`);
                 }
                 
                 resolve(parsed);
                 
             } catch (error) {
-                console.error('❌ JSON parse error:', error.message);
-                console.error('Body preview:', body ? body.substring(0, 200) + '...' : 'null');
-                console.error('Body suffix:', body ? '...' + body.substring(body.length - 200) : 'null');
-                reject(new Error(`JSON parse error: ${error.message}`));
+                console.error('❌ [PARSE] JSON parse error:', error.message);
+                console.error('❌ [PARSE] Content-Type:', contentType);
+                console.error('❌ [PARSE] Body preview:', body ? body.substring(0, 500) + '...' : 'null');
+                console.error('❌ [PARSE] Body suffix:', body ? '...' + body.substring(body.length - 200) : 'null');
+                reject(new Error(`JSON parse error for ${contentType}: ${error.message}`));
             }
         });
         
         req.on('error', (error) => {
             clearTimeout(timeout);
-            console.error('❌ Stream error:', error);
+            console.error('❌ [PARSE] Stream error:', error);
             reject(new Error(`Stream error: ${error.message}`));
         });
         
-        // ✅ Handle connection issues
         req.on('close', () => {
             clearTimeout(timeout);
-            console.log('📦 Request connection closed');
+            console.log('📦 [PARSE] Request connection closed');
         });
     });
 }
