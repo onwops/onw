@@ -9,46 +9,103 @@ const ENABLE_DETAILED_LOGGING = false;
 // ==========================================
 
 let redisClient = null;
+// ✅ ROBUST parseNodeJSBody for large SDP payloads
+// ✅ Enhanced parseNodeJSBody to handle both text/plain and application/json
 async function parseNodeJSBody(req) {
     return new Promise((resolve, reject) => {
-        let body = '';
-        let size = 0;
-        const maxSize = 1024 * 1024; // 1MB limit
+        const chunks = [];
+        let totalSize = 0;
+        const maxSize = 10 * 1024 * 1024; // 10MB limit
+        
+        // ✅ Detect Content-Type
+        const contentType = req.headers['content-type'] || 'text/plain';
+        console.log(`📦 [PARSE] Content-Type: ${contentType}`);
         
         const timeout = setTimeout(() => {
+            console.error('❌ [PARSE] Request body parsing timeout after 15s');
             reject(new Error('Request body parsing timeout'));
-        }, 10000);
+        }, 15000); // Increased timeout for large payloads
         
         req.on('data', (chunk) => {
-            size += chunk.length;
+            totalSize += chunk.length;
             
-            if (size > maxSize) {
+            if (totalSize > maxSize) {
                 clearTimeout(timeout);
+                console.error(`❌ [PARSE] Request body too large: ${totalSize} bytes`);
                 reject(new Error('Request body too large'));
                 return;
             }
             
-            body += chunk.toString();
+            chunks.push(chunk);
+            console.log(`📦 [PARSE] Chunk received: ${chunk.length} bytes (total: ${totalSize})`);
         });
         
         req.on('end', () => {
             clearTimeout(timeout);
+            
             try {
+                // ✅ Proper Buffer concatenation
+                const body = Buffer.concat(chunks).toString('utf8');
+                console.log(`📦 [PARSE] Body assembled: ${body.length} chars`);
+                console.log(`📦 [PARSE] Body preview: ${body.substring(0, 200)}...`);
+                
                 if (!body.trim()) {
+                    console.error('❌ [PARSE] Empty request body');
                     reject(new Error('Empty request body'));
                     return;
                 }
                 
-                const parsed = JSON.parse(body);
+                // ✅ Handle different content types
+                let parsed;
+                
+                if (contentType.includes('application/json')) {
+                    console.log('📦 [PARSE] Parsing as JSON (application/json)');
+                    parsed = JSON.parse(body);
+                } else if (contentType.includes('text/plain')) {
+                    console.log('📦 [PARSE] Parsing as JSON from text/plain');
+                    // Validate JSON structure first
+                    if (!body.startsWith('{') || !body.endsWith('}')) {
+                        console.error('❌ [PARSE] Invalid JSON structure in text/plain:', {
+                            starts: body.substring(0, 50),
+                            ends: body.substring(body.length - 50)
+                        });
+                        reject(new Error('Invalid JSON structure in text/plain'));
+                        return;
+                    }
+                    parsed = JSON.parse(body);
+                } else {
+                    // Fallback: try to parse as JSON anyway
+                    console.log(`📦 [PARSE] Unknown content-type ${contentType}, attempting JSON parse`);
+                    parsed = JSON.parse(body);
+                }
+                
+                console.log(`✅ [PARSE] Successfully parsed ${contentType}, action: ${parsed.action}`);
+                
+                // ✅ Enhanced logging for specific actions
+                if (parsed.action === 'send-signal' && parsed.payload?.sdp) {
+                    console.log(`📦 [PARSE] SDP signal detected: ${parsed.type}, SDP size: ${parsed.payload.sdp.length}`);
+                }
+                
                 resolve(parsed);
+                
             } catch (error) {
-                reject(new Error(`JSON parse error: ${error.message}`));
+                console.error('❌ [PARSE] JSON parse error:', error.message);
+                console.error('❌ [PARSE] Content-Type:', contentType);
+                console.error('❌ [PARSE] Body preview:', body ? body.substring(0, 500) + '...' : 'null');
+                console.error('❌ [PARSE] Body suffix:', body ? '...' + body.substring(body.length - 200) : 'null');
+                reject(new Error(`JSON parse error for ${contentType}: ${error.message}`));
             }
         });
         
         req.on('error', (error) => {
             clearTimeout(timeout);
+            console.error('❌ [PARSE] Stream error:', error);
             reject(new Error(`Stream error: ${error.message}`));
+        });
+        
+        req.on('close', () => {
+            clearTimeout(timeout);
+            console.log('📦 [PARSE] Request connection closed');
         });
     });
 }
@@ -529,7 +586,15 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
 }
 async function handleSendSignal(userId, data) {
     const { matchId, type, payload } = data;
+   console.log(`📤 [SIGNAL] ${userId.slice(-8)} sending ${type} to match ${matchId?.slice(-8)}`);
     
+    // ✅ Special logging for offer/answer
+    if (type === 'offer' || type === 'answer') {
+        console.log(`📤 [${type.toUpperCase()}] Received from ${userId.slice(-8)}`);
+        console.log(`📤 [${type.toUpperCase()}] SDP size: ${payload?.sdp?.length || 0} chars`);
+        console.log(`📤 [${type.toUpperCase()}] SDP preview: ${payload?.sdp?.substring(0, 100)}...`);
+        console.log(`📤 [${type.toUpperCase()}] Payload keys: ${Object.keys(payload || {})}`);
+    }
     // ✅ SỬA: Enhanced validation
     if (!matchId || !type || !payload) {
         return {
