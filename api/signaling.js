@@ -9,7 +9,49 @@ const ENABLE_DETAILED_LOGGING = false;
 // ==========================================
 
 let redisClient = null;
-
+async function parseNodeJSBody(req) {
+    return new Promise((resolve, reject) => {
+        let body = '';
+        let size = 0;
+        const maxSize = 1024 * 1024; // 1MB limit
+        
+        const timeout = setTimeout(() => {
+            reject(new Error('Request body parsing timeout'));
+        }, 10000);
+        
+        req.on('data', (chunk) => {
+            size += chunk.length;
+            
+            if (size > maxSize) {
+                clearTimeout(timeout);
+                reject(new Error('Request body too large'));
+                return;
+            }
+            
+            body += chunk.toString();
+        });
+        
+        req.on('end', () => {
+            clearTimeout(timeout);
+            try {
+                if (!body.trim()) {
+                    reject(new Error('Empty request body'));
+                    return;
+                }
+                
+                const parsed = JSON.parse(body);
+                resolve(parsed);
+            } catch (error) {
+                reject(new Error(`JSON parse error: ${error.message}`));
+            }
+        });
+        
+        req.on('error', (error) => {
+            clearTimeout(timeout);
+            reject(new Error(`Stream error: ${error.message}`));
+        });
+    });
+}
 async function getRedisClient() {
     if (!redisClient) {
         redisClient = createClient({
@@ -248,17 +290,27 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
 // ✅ FIXED: NODE.JS REQUEST HANDLERS
 // ==========================================
 
-async function handleInstantMatch(userId, data) {
+ async function handleInstantMatch(userId, data) {
     const { userInfo, preferredMatchId, chatZone, gender } = data;
-    /*
+    
+    // ✅ SỬA: Enhanced validation
     if (!userId || typeof userId !== 'string') {
         return {
             statusCode: 400,
-            body: JSON.stringify({ error: 'userId is required and must be string' })
+            body: JSON.stringify({ 
+                error: 'userId is required and must be string',
+                received: { userId, type: typeof userId }
+            })
         };
     }
-    */
-    console.log(`[INSTANT-MATCH] ${userId.slice(-8)} looking for partner`);
+    
+    // ✅ THÊM: Debug log
+    console.log(`[INSTANT-MATCH] ${userId.slice(-8)} looking for partner`, {
+        hasUserInfo: !!userInfo,
+        chatZone,
+        gender,
+        dataKeys: Object.keys(data)
+    });
     
     // Check if user already in a match
     const waitingUsers = await getAllWaitingUsersFromRedis();
@@ -301,7 +353,7 @@ async function handleInstantMatch(userId, data) {
         
         await setMatch(matchId, match);
         
-        console.log(`[INSTANT-MATCH] 🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId})`);
+        console.log(`[INSTANT-MATCH] 🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score}`);
         
         return {
             statusCode: 200,
@@ -332,12 +384,15 @@ async function handleInstantMatch(userId, data) {
         await addWaitingUserToRedis(userId, waitingUser);
         
         const currentWaitingUsers = await getAllWaitingUsersFromRedis();
+        const position = Array.from(currentWaitingUsers.keys()).indexOf(userId) + 1;
+        
+        console.log(`[INSTANT-MATCH] ${userId.slice(-8)} added to waiting list (position: ${position})`);
         
         return {
             statusCode: 200,
             body: JSON.stringify({
                 status: 'waiting',
-                position: currentWaitingUsers.size,
+                position: position || currentWaitingUsers.size,
                 waitingUsers: currentWaitingUsers.size,
                 chatZone: chatZone,
                 userGender: userGender,
@@ -349,27 +404,37 @@ async function handleInstantMatch(userId, data) {
         };
     }
 }
-
 async function handleSendSignal(userId, data) {
     const { matchId, type, payload } = data;
-    /*
+    
+    // ✅ SỬA: Enhanced validation
     if (!matchId || !type || !payload) {
         return {
             statusCode: 400,
             body: JSON.stringify({ 
                 error: 'Missing required fields',
-                required: ['matchId', 'type', 'payload']
+                required: ['matchId', 'type', 'payload'],
+                received: {
+                    matchId: !!matchId,
+                    type: !!type,
+                    payload: !!payload,
+                    dataKeys: Object.keys(data)
+                }
             })
         };
     }
-    */
+    
+    // ✅ THÊM: Debug log
+    console.log(`[SEND-SIGNAL] ${userId.slice(-8)} sending ${type} to match ${matchId.slice(-8)}`);
+    
     const match = await getMatch(matchId);
     if (!match) {
         return {
             statusCode: 404,
             body: JSON.stringify({ 
                 error: 'Match not found',
-                matchId
+                matchId,
+                tip: 'Match may have expired or been deleted'
             })
         };
     }
@@ -377,7 +442,11 @@ async function handleSendSignal(userId, data) {
     if (match.p1 !== userId && match.p2 !== userId) {
         return {
             statusCode: 403,
-            body: JSON.stringify({ error: 'User not in this match' })
+            body: JSON.stringify({ 
+                error: 'User not in this match',
+                userId: userId.slice(-8),
+                matchUsers: [match.p1.slice(-8), match.p2.slice(-8)]
+            })
         };
     }
     
@@ -399,11 +468,12 @@ async function handleSendSignal(userId, data) {
     // Limit queue size
     if (match.signals[partnerId].length > 100) {
         match.signals[partnerId] = match.signals[partnerId].slice(-50);
+        console.log(`[SEND-SIGNAL] Trimmed signal queue for ${partnerId.slice(-8)}`);
     }
     
     await setMatch(matchId, match);
     
-    console.log(`[SEND-SIGNAL] ${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type})`);
+    console.log(`[SEND-SIGNAL] ✅ ${userId.slice(-8)} -> ${partnerId.slice(-8)} (${type}) | Queue: ${match.signals[partnerId].length}`);
     
     return {
         statusCode: 200,
@@ -416,126 +486,117 @@ async function handleSendSignal(userId, data) {
         })
     };
 }
-
 async function handleGetSignals(userId, data) {
-    // Implementation similar to above pattern...
-    const waitingUsers = await getAllWaitingUsersFromRedis();
+    const { chatZone, gender, userInfo } = data;
     
-    // Check for matches first
-    // ... (implement similar to above pattern)
-    
-    return {
-        statusCode: 200,
-        body: JSON.stringify({
-            status: 'waiting',
-            timestamp: Date.now()
-        })
-    };
-}
-
-// ==========================================
-// ✅ FIXED: NODE.JS MAIN HANDLER
-// ==========================================
-
-export default async function handler(req, res) {
-    // ✅ FIX: Node.js API format
-    const startTime = Date.now();
-    
-    // CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
-    if (req.method === 'OPTIONS') {
-        res.status(200).end();
-        return;
-    }
-    
-    if (req.method === 'GET') {
-        const debug = req.query.debug;
-        
-        if (debug === 'true') {
-            const waitingUsers = await getAllWaitingUsersFromRedis();
-            
-            res.status(200).json({
-                status: 'redis-integrated-webrtc-signaling',
-                runtime: 'nodejs18.x',
-                version: '3.0-redis-nodejs',
-                storage: 'Redis Labs',
-                fixes: [
-                    'Node.js runtime compatibility',
-                    'Redis Labs integration',
-                    'No more multi-instance issues',
-                    'Proper SSL/TLS configuration'
-                ],
-                stats: {
-                    waitingUsers: waitingUsers.size,
-                    redisConnected: !!redisClient
-                },
-                timestamp: Date.now()
-            });
-            return;
-        }
-        
-        res.status(200).json({ 
-            status: 'redis-nodejs-signaling-ready',
-            message: 'Redis + Node.js WebRTC signaling server ready!',
-            timestamp: Date.now()
-        });
-        return;
-    }
-    
-    if (req.method !== 'POST') {
-        res.status(405).json({ error: 'POST required for signaling' });
-        return;
-    }
+    // ✅ THÊM: Debug log
+    console.log(`[GET-SIGNALS] ${userId.slice(-8)} checking for signals/matches`);
     
     try {
-        // ✅ FIX: Node.js body parsing
-        const data = req.body;
-        const { action, userId } = data;
+        // Check all active matches for this user
+        const redis = await getRedisClient();
+        const matchKeys = await redis.keys('match:*');
         
-        if (!action) {
-            res.status(400).json({
-                error: 'Missing required fields',
-                required: ['action', 'userId'],
-                received: Object.keys(data || {})
-            });
-            return;
-        }
-        
-        // Handle different actions
-        let result;
-        switch (action) {
-            case 'instant-match':
-                result = await handleInstantMatch(userId, data);
-                break;
-            case 'send-signal':
-                result = await handleSendSignal(userId, data);
-                break;
-            case 'get-signals':
-                result = await handleGetSignals(userId, data);
-                break;
-            default:
-                result = {
-                    statusCode: 404,
+        for (const key of matchKeys) {
+            const matchId = key.replace('match:', '');
+            const match = await getMatch(matchId);
+            
+            if (match && (match.p1 === userId || match.p2 === userId)) {
+                const partnerId = match.p1 === userId ? match.p2 : match.p1;
+                const signals = match.signals[userId] || [];
+                
+                // Clear signals after reading
+                match.signals[userId] = [];
+                await setMatch(matchId, match);
+                
+                console.log(`[GET-SIGNALS] ✅ ${userId.slice(-8)} found match ${matchId.slice(-8)} with ${signals.length} signals`);
+                
+                return {
+                    statusCode: 200,
                     body: JSON.stringify({
-                        error: 'Unknown action',
-                        received: action,
-                        available: ['instant-match', 'get-signals', 'send-signal']
+                        status: 'matched',
+                        matchId,
+                        partnerId,
+                        isInitiator: match.p1 === userId,
+                        signals,
+                        partnerChatZone: match.chatZones ? match.chatZones[partnerId] : null,
+                        matchScore: match.matchScore || null,
+                        strategy: match.strategy || 'simple',
+                        timestamp: Date.now()
                     })
                 };
+            }
         }
-
-        res.status(result.statusCode).json(JSON.parse(result.body));
-
-    } catch (error) {
-        console.error('[ERROR] Server error:', error.message);
         
-        res.status(500).json({
-            error: 'Internal server error',
-            message: error.message,
-            processing_time: Date.now() - startTime
-        });
+        // If no active match, check waiting list
+        const waitingUsers = await getAllWaitingUsersFromRedis();
+        
+        if (waitingUsers.has(userId)) {
+            const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
+            
+            console.log(`[GET-SIGNALS] ${userId.slice(-8)} waiting in position ${position}`);
+            
+            return {
+                statusCode: 200,
+                body: JSON.stringify({
+                    status: 'waiting',
+                    position,
+                    waitingUsers: waitingUsers.size,
+                    chatZone: chatZone,
+                    userGender: gender || 'Unspecified',
+                    timestamp: Date.now()
+                })
+            };
+        } else {
+            // ✅ AUTO-RECOVERY: Add user back to waiting list if they have valid data
+            if (chatZone !== undefined) {
+                const waitingUser = {
+                    userId,
+                    userInfo: userInfo || {},
+                    chatZone: chatZone,
+                    timestamp: Date.now()
+                };
+                
+                await addWaitingUserToRedis(userId, waitingUser);
+                const currentWaitingUsers = await getAllWaitingUsersFromRedis();
+                
+                console.log(`[GET-SIGNALS] ${userId.slice(-8)} auto-recovered to waiting list`);
+                
+                return {
+                    statusCode: 200,
+                    body: JSON.stringify({
+                        status: 'waiting',
+                        position: currentWaitingUsers.size,
+                        waitingUsers: currentWaitingUsers.size,
+                        chatZone: chatZone,
+                        userGender: gender || 'Unspecified',
+                        message: 'Auto-recovered to waiting list',
+                        timestamp: Date.now()
+                    })
+                };
+            }
+        }
+        
+        return {
+            statusCode: 404,
+            body: JSON.stringify({
+                status: 'not_found',
+                message: 'User not found in waiting list or active matches',
+                tip: 'Try calling instant-match first',
+                timestamp: Date.now()
+            })
+        };
+        
+    } catch (error) {
+        console.error(`[GET-SIGNALS-ERROR] ${userId.slice(-8)}:`, error.message);
+        
+        return {
+            statusCode: 500,
+            body: JSON.stringify({
+                error: 'Failed to get signals',
+                message: error.message,
+                timestamp: Date.now()
+            })
+        };
     }
 }
