@@ -738,15 +738,26 @@ function handleP2pConnected(userId, data) {
     
     let removed = false;
     
-    // Use optimized removal
+    // ✅ FIX: CHỈ xóa khỏi waiting list
     if (removeWaitingUser(userId)) removed = true;
     if (removeWaitingUser(partnerId)) removed = true;
     
-    activeMatches.delete(matchId);
+    // ✅ FIX: KHÔNG xóa match, chỉ đánh dấu là connected
+    const match = activeMatches.get(matchId);
+    if (match) {
+        match.connected = true;
+        match.connectedAt = Date.now();
+        criticalLog('P2P-CONNECTED', `Match ${matchId} marked as connected`);
+    } else {
+        criticalLog('P2P-CONNECTED', `Match ${matchId} not found (may have been cleaned up)`);
+    }
+    
+    // ❌ REMOVED: activeMatches.delete(matchId);
     
     return createCorsResponse({
         status: 'p2p_connected',
         removed,
+        matchPreserved: !!match,
         timestamp: Date.now()
     });
 }
@@ -759,10 +770,12 @@ function handleDisconnect(userId) {
     // Use optimized removal
     if (removeWaitingUser(userId)) removed = true;
     
+    // ✅ FIX: Better match cleanup on disconnect
     for (const [matchId, match] of activeMatches.entries()) {
         if (match.p1 === userId || match.p2 === userId) {
             const partnerId = match.p1 === userId ? match.p2 : match.p1;
             
+            // Send disconnect signal to partner
             if (match.signals && match.signals[partnerId]) {
                 match.signals[partnerId].push({
                     type: 'disconnect',
@@ -772,8 +785,18 @@ function handleDisconnect(userId) {
                 });
             }
             
-            criticalLog('DISCONNECT', `Removing match ${matchId}`);
-            activeMatches.delete(matchId);
+            // ✅ FIX: Mark match as disconnected instead of immediate deletion
+            match.disconnected = true;
+            match.disconnectedAt = Date.now();
+            match.disconnectedBy = userId;
+            
+            // ✅ DELETE after a short delay to allow partner to receive disconnect signal
+            setTimeout(() => {
+                activeMatches.delete(matchId);
+                criticalLog('DISCONNECT', `Delayed removal of match ${matchId}`);
+            }, 5000); // 5 second delay
+            
+            criticalLog('DISCONNECT', `Match ${matchId} marked for removal`);
             removed = true;
             break;
         }
@@ -789,11 +812,15 @@ function handleDisconnect(userId) {
 // ==========================================
 // OPTIMIZED CLEANUP
 // ==========================================
-
 function cleanup() {
     const now = Date.now();
     let cleanedUsers = 0;
     let cleanedMatches = 0;
+    
+    // ✅ TIMEOUTS - Phân biệt signaling và connected
+    const SIGNALING_TIMEOUT = 120000;  // 2 phút cho signaling exchange
+    const CONNECTED_TIMEOUT = 300000;  // 5 phút sau khi P2P connected
+    const USER_TIMEOUT = 120000;       // 2 phút cho waiting users
     
     // Batch cleanup - collect expired IDs first
     const expiredUsers = [];
@@ -803,10 +830,24 @@ function cleanup() {
         }
     }
     
+    // ✅ FIX: Smart match cleanup based on connection status
     const expiredMatches = [];
     for (const [matchId, match] of activeMatches.entries()) {
-        if (now - match.timestamp > MATCH_LIFETIME) {
-            expiredMatches.push(matchId);
+        const age = now - match.timestamp;
+        
+        if (!match.connected) {
+            // ✅ Match chưa connected - chỉ xóa sau 2 phút signaling
+            if (age > SIGNALING_TIMEOUT) {
+                expiredMatches.push(matchId);
+                criticalLog('CLEANUP', `Expired signaling match: ${matchId} (${Math.round(age/1000)}s old)`);
+            }
+        } else {
+            // ✅ Match đã connected - xóa sau 5 phút connected
+            const connectedAge = now - match.connectedAt;
+            if (connectedAge > CONNECTED_TIMEOUT) {
+                expiredMatches.push(matchId);
+                criticalLog('CLEANUP', `Expired connected match: ${matchId} (connected ${Math.round(connectedAge/1000)}s ago)`);
+            }
         }
     }
     
@@ -837,6 +878,151 @@ function cleanup() {
         criticalLog('CLEANUP', `Removed ${cleanedUsers} users, ${cleanedMatches} matches. Active: ${waitingUsers.size} waiting, ${activeMatches.size} matched`);
     }
 }
+
+// ==========================================
+// 3. ✅ FIXED: handleInstantMatch - Ensure match object has proper structure
+// ==========================================
+
+function handleInstantMatch(userId, data) {
+    const { userInfo, preferredMatchId, chatZone, gender } = data;
+    
+    // MINIMAL VALIDATION - NO chatZone validation to avoid 400 error
+    if (!userId || typeof userId !== 'string') {
+        return createCorsResponse({ error: 'userId is required and must be string' }, 400);
+    }
+    
+    smartLog('INSTANT-MATCH', `${userId.slice(-8)} looking for partner (ChatZone: ${chatZone})`);
+    
+    // ✅ KIỂM TRA ACTIVE MATCHES TRƯỚC - không thay đổi
+    for (const [matchId, match] of activeMatches.entries()) {
+        if (match.p1 === userId || match.p2 === userId) {
+            const partnerId = match.p1 === userId ? match.p2 : match.p1;
+            return createCorsResponse({
+                status: 'already-matched',
+                matchId,
+                partnerId,
+                isInitiator: match.p1 === userId,
+                message: 'User already in active match',
+                timestamp: Date.now()
+            });
+        }
+    }
+    
+    // 🔧 ADAPTIVE MATCHING STRATEGY
+    const userGender = gender || userInfo?.gender || 'Unspecified';
+    const startTime = Date.now();
+    
+    let bestMatch;
+    let strategy;
+    
+    if (waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD) {
+        bestMatch = findSimpleMatchExcludeSelf(userId, chatZone, userGender);
+        strategy = 'simple';
+    } else if (waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD) {
+        bestMatch = findHybridMatchExcludeSelf(userId, chatZone, userGender);
+        strategy = 'hybrid';
+    } else {
+        buildIndexesIfNeeded();
+        bestMatch = findUltraFastMatchExcludeSelf(userId, chatZone, userGender);
+        strategy = 'optimized';
+    }
+    
+    if (bestMatch) {
+        const partnerId = bestMatch.userId;
+        const partnerUser = bestMatch.user;
+        
+        // ✅ FIX: CHỈ xóa cả 2 users KHI tìm thấy match
+        removeWaitingUser(userId);
+        removeWaitingUser(partnerId);
+        
+        // Create match
+        const matchId = preferredMatchId || `match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+        
+        const isUserInitiator = userId < partnerId;
+        const p1 = isUserInitiator ? userId : partnerId;
+        const p2 = isUserInitiator ? partnerId : userId;
+        
+        // ✅ FIX: Enhanced match object with connection tracking
+        const match = {
+            p1, p2,
+            timestamp: Date.now(),
+            connected: false,           // ✅ NEW: Track connection status
+            connectedAt: null,          // ✅ NEW: Track when P2P connected
+            signals: { [p1]: [], [p2]: [] },
+            userInfo: {
+                [userId]: userInfo || {},
+                [partnerId]: partnerUser.userInfo || {}
+            },
+            chatZones: {
+                [userId]: chatZone,
+                [partnerId]: partnerUser.chatZone
+            },
+            matchScore: bestMatch.score,
+            strategy: strategy
+        };
+        
+        activeMatches.set(matchId, match);
+        
+        criticalLog('INSTANT-MATCH', `🚀 ${userId.slice(-8)} <-> ${partnerId.slice(-8)} (${matchId}) | Score: ${bestMatch.score} | Strategy: ${strategy}`);
+        
+        return createCorsResponse({
+            status: 'instant-match',
+            matchId,
+            partnerId,
+            isInitiator: isUserInitiator,
+            partnerInfo: partnerUser.userInfo || {},
+            partnerChatZone: partnerUser.chatZone,
+            signals: [],
+            compatibility: bestMatch.score,
+            strategy: strategy,
+            message: 'Instant match found! WebRTC connection will be established.',
+            timestamp: Date.now()
+        });
+        
+    } else {
+        // ✅ FIX: Thêm hoặc update user trong waiting list
+        const waitingUser = {
+            userId,
+            userInfo: userInfo || {},
+            chatZone: chatZone || null,
+            timestamp: Date.now()
+        };
+        
+        // Kiểm tra xem user đã có trong waiting list chưa
+        if (waitingUsers.has(userId)) {
+            // Update thông tin user hiện tại
+            const existingUser = waitingUsers.get(userId);
+            existingUser.userInfo = userInfo || existingUser.userInfo || {};
+            existingUser.chatZone = chatZone !== undefined ? chatZone : existingUser.chatZone;
+            existingUser.timestamp = Date.now(); // Update timestamp
+            
+            // Update indexes if needed
+            removeUserFromIndexes(userId, existingUser);
+            addUserToIndexes(userId, existingUser);
+            
+            smartLog('INSTANT-MATCH', `${userId.slice(-8)} updated in waiting list`);
+        } else {
+            // Thêm user mới vào waiting list
+            addWaitingUser(userId, waitingUser);
+            smartLog('INSTANT-MATCH', `${userId.slice(-8)} added to waiting list`);
+        }
+        
+        const position = Array.from(waitingUsers.keys()).indexOf(userId) + 1;
+        
+        return createCorsResponse({
+            status: 'waiting',
+            position,
+            waitingUsers: waitingUsers.size,
+            chatZone: chatZone,
+            userGender: userGender,
+            strategy: strategy || 'simple',
+            message: 'Added to matching queue. Waiting for partner...',
+            estimatedWaitTime: Math.min(waitingUsers.size * 2, 30),
+            timestamp: Date.now()
+        });
+    }
+}
+
 
 // ==========================================
 // ✅ FIXED: REQUEST BODY PARSING FOR VERCEL EDGE
