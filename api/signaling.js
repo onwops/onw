@@ -507,8 +507,8 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
         await removeWaitingUserFromRedis(partnerId);
         
         // Create match
-        const matchId = `instant_${userId}_${Date.now()}`;
-        
+        const sortedUsers = [userId, partnerId].sort();
+        const matchId = `match_${sortedUsers[0]}_${sortedUsers[1]}}`;        
         const isUserInitiator = userId < partnerId;
         const p1 = isUserInitiator ? userId : partnerId;
         const p2 = isUserInitiator ? partnerId : userId;
