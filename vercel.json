@@ -1,18 +1,49 @@
+
 {
   "functions": {
     "api/**/*.js": {
-	   "maxDuration": 60,
-           "memory": 512
-
+      "maxDuration": 10,
+      "memory": 512,
+      "runtime": "edge"
     }
   },
-"routes": [
+  "routes": [
     {
       "src": "/api/(.*)",
       "dest": "/api/$1",
       "headers": {
-        "cache-control": "no-cache"
+        "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0, s-maxage=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Edge-Cache-Tag": "none",
+        "Vercel-Cache-Control": "no-cache",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With"
       }
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/**",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-cache, no-store, must-revalidate, max-age=0, s-maxage=0"
+        },
+        {
+          "key": "Pragma",
+          "value": "no-cache"
+        },
+        {
+          "key": "Expires",
+          "value": "0"
+        },
+        {
+          "key": "Surrogate-Control",
+          "value": "no-store"
+        }
+      ]
     }
   ]
 }
