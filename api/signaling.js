@@ -55,16 +55,13 @@ async function parseNodeJSBody(req) {
 async function getRedisClient() {
     if (!redisClient) {
         redisClient = createClient({
-            // ✅ FIX: Proper Redis Labs URL format for Node.js
+            // ✅ FIX: Bỏ s khỏi rediss://
             url: "redis://default:SXZanOZvHCZurRd8dTCudyIKvciwuNz0@redis-12481.c294.ap-northeast-1-2.ec2.redns.redis-cloud.com:12481",
             socket: {
-                // ✅ FIX: Correct TLS config for Redis Labs
-                tls: true,
-                rejectUnauthorized: false,
+                // ✅ FIX: Bỏ toàn bộ TLS config
                 connectTimeout: 10000,
                 commandTimeout: 5000
             },
-            // ✅ FIX: Add retry strategy
             retry_strategy: (options) => {
                 if (options.error && options.error.code === 'ECONNREFUSED') {
                     return new Error('The server refused the connection');
@@ -97,7 +94,6 @@ async function getRedisClient() {
     }
     return redisClient;
 }
-
 // ==========================================
 // REDIS HELPER FUNCTIONS
 // ==========================================
