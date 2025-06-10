@@ -518,7 +518,7 @@ export default async function handler(req, res) {
                 break;
             default:
                 result = {
-                    statusCode: 400,
+                    statusCode: 404,
                     body: JSON.stringify({
                         error: 'Unknown action',
                         received: action,
