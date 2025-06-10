@@ -482,11 +482,7 @@ function handleInstantMatch(userId, data) {
         }
     }
     
-    // Temporarily remove from waiting list to avoid self-matching
-    const existingWaitingUser = waitingUsers.get(userId);
-    if (existingWaitingUser) {
-        removeWaitingUser(userId);
-    }
+
     
     // 🔧 ADAPTIVE MATCHING STRATEGY
     const userGender = gender || userInfo?.gender || 'Unspecified';
