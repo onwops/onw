@@ -995,3 +995,4 @@ export default async function handler(req) {
         }, 500);
     }
 }
+export const config = { runtime: 'edge' };
