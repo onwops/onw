@@ -696,14 +696,14 @@ function cleanup() {
         if (!match.connected) {
             // ✅ Match chưa connected - chỉ xóa sau 2 phút signaling
             if (age > SIGNALING_TIMEOUT) {
-                expiredMatches.push(matchId);
+                // expiredMatches.push(matchId);
                 criticalLog('CLEANUP', `Expired signaling match: ${matchId} (${Math.round(age/1000)}s old)`);
             }
         } else {
             // ✅ Match đã connected - xóa sau 5 phút connected
             const connectedAge = now - match.connectedAt;
             if (connectedAge > CONNECTED_TIMEOUT) {
-                expiredMatches.push(matchId);
+                // expiredMatches.push(matchId);
                 criticalLog('CLEANUP', `Expired connected match: ${matchId} (connected ${Math.round(connectedAge/1000)}s ago)`);
             }
         }
