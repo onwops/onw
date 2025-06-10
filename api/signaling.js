@@ -494,8 +494,8 @@ export default async function handler(req, res) {
         // ✅ FIX: Node.js body parsing
         const data = req.body;
         const { action, userId } = data;
-        /*
-        if (!action || !userId) {
+        
+        if (!action) {
             res.status(400).json({
                 error: 'Missing required fields',
                 required: ['action', 'userId'],
@@ -503,7 +503,7 @@ export default async function handler(req, res) {
             });
             return;
         }
-        */
+        
         // Handle different actions
         let result;
         switch (action) {
