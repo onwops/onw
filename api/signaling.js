@@ -1,7 +1,6 @@
 // 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - VERCEL EDGE FIXED
 
 const ENABLE_DETAILED_LOGGING = false;
-echo "Force Deploy"
 
 // ==========================================
 // CONFIGURATION & CONSTANTS
