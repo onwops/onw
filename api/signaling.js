@@ -1,4 +1,4 @@
-// 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - FIXED VERSION
+// 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - VERCEL EDGE FIXED
 
 const ENABLE_DETAILED_LOGGING = false;
 
@@ -46,15 +46,6 @@ let removedUsers = new Map(); // userId -> user data for cleanup
 let distanceCache = new Map(); // "zone1,zone2" -> circularDistance
 let timezoneScoreTable = new Array(25); // Pre-calculated scores 0-24
 let genderScoreTable = new Map(); // Pre-calculated gender combinations
-
-// 🔥 OPTIMIZATION: Object pools for memory optimization
-let matchObjectPool = [];
-let signalObjectPool = [];
-
-// ==========================================
-// PERFORMANCE MONITORING
-// ==========================================
-
 
 // ==========================================
 // LOGGING UTILITIES
@@ -491,9 +482,6 @@ function handleInstantMatch(userId, data) {
         }
     }
     
-    // ✅ FIX: KHÔNG XÓA user khỏi waiting list trước khi tìm match
-    // Thay vào đó, chỉ cần exclude khi tìm kiếm
-    
     // 🔧 ADAPTIVE MATCHING STRATEGY
     const userGender = gender || userInfo?.gender || 'Unspecified';
     const startTime = Date.now();
@@ -616,7 +604,7 @@ function handleInstantMatch(userId, data) {
 }
 
 // ==========================================
-// ✅ FIXED: OTHER HANDLERS WITH IMPROVED GET-SIGNALS
+// ✅ FIXED: OTHER HANDLERS
 // ==========================================
 
 function handleGetSignals(userId, data) {
@@ -851,36 +839,69 @@ function cleanup() {
 }
 
 // ==========================================
-// MAIN HANDLER FUNCTION
+// ✅ FIXED: REQUEST BODY PARSING FOR VERCEL EDGE
 // ==========================================
 
-export default async function handler(req) {
+async function parseRequestBody(request) {
+    try {
+        // Method 1: Try built-in json() method first (most reliable for Vercel Edge)
+        if (request.headers.get('content-type')?.includes('application/json')) {
+            return await request.json();
+        }
+        
+        // Method 2: Handle text/plain body (fallback)
+        const textBody = await request.text();
+        
+        if (!textBody || !textBody.trim()) {
+            throw new Error('Empty request body');
+        }
+        
+        // Try to parse as JSON
+        try {
+            return JSON.parse(textBody);
+        } catch (parseError) {
+            throw new Error(`Invalid JSON: ${parseError.message}`);
+        }
+        
+    } catch (error) {
+        throw new Error(`Body parsing failed: ${error.message}`);
+    }
+}
+
+// ==========================================
+// MAIN HANDLER FUNCTION - VERCEL EDGE OPTIMIZED
+// ==========================================
+
+export default async function handler(request) {
+    // Quick cleanup at start to prevent timeouts
+    const startTime = Date.now();
     cleanup();
     
-    if (req.method === 'OPTIONS') {
+    if (request.method === 'OPTIONS') {
         return createCorsResponse(null, 200);
     }
     
-    if (req.method === 'GET') {
-        const url = new URL(req.url);
+    if (request.method === 'GET') {
+        const url = new URL(request.url);
         const debug = url.searchParams.get('debug');
         
         if (debug === 'true') {
             return createCorsResponse({
-                status: 'hybrid-optimized-webrtc-signaling-fixed',
-                runtime: 'edge',
-                version: '2.0-fixed',
+                status: 'hybrid-optimized-webrtc-signaling-vercel-fixed',
+                runtime: 'vercel-edge',
+                version: '2.1-vercel-fixed',
                 strategies: {
                     simple: `≤${SIMPLE_STRATEGY_THRESHOLD} users`,
                     hybrid: `${SIMPLE_STRATEGY_THRESHOLD + 1}-${HYBRID_STRATEGY_THRESHOLD} users`, 
                     optimized: `>${HYBRID_STRATEGY_THRESHOLD} users`
                 },
                 fixes: [
+                    'Vercel Edge Runtime compatible request body parsing',
+                    'Timeout prevention with fast cleanup',
                     'Race condition eliminated in instant-match',
                     'Real-time index synchronization',
                     'Auto-recovery in get-signals',
-                    'Self-exclusion in all matching strategies',
-                    'Immediate index cleanup on user removal'
+                    'Self-exclusion in all matching strategies'
                 ],
                 stats: {
                     waitingUsers: waitingUsers.size,
@@ -895,79 +916,56 @@ export default async function handler(req) {
                         pendingRemoves: removedUsers.size
                     }
                 },
+                performance: {
+                    startupTime: Date.now() - startTime
+                },
                 timestamp: Date.now()
             });
         }
         
         return createCorsResponse({ 
-            status: 'hybrid-optimized-signaling-ready-fixed',
-            runtime: 'edge',
-            version: '2.0-fixed',
+            status: 'hybrid-optimized-signaling-vercel-ready',
+            runtime: 'vercel-edge',
+            version: '2.1-vercel-fixed',
             stats: { 
                 waiting: waitingUsers.size, 
                 matches: activeMatches.size,
                 strategy: waitingUsers.size <= SIMPLE_STRATEGY_THRESHOLD ? 'simple' : 
                          waitingUsers.size <= HYBRID_STRATEGY_THRESHOLD ? 'hybrid' : 'optimized'
             },
-            message: 'Fixed WebRTC signaling server - no more race conditions!',
+            message: 'Vercel Edge optimized WebRTC signaling server ready!',
             timestamp: Date.now()
         });
     }
     
-    if (req.method !== 'POST') {
+    if (request.method !== 'POST') {
         return createCorsResponse({ error: 'POST required for signaling' }, 405);
     }
     
     try {
-        // Read text/plain body and convert to JSON
-        let requestBody = '';
+        // ✅ FIXED: Vercel Edge compatible body parsing
+        const data = await parseRequestBody(request);
         
-        if (!req.body) {
-            return createCorsResponse({ 
-                error: 'No request body found',
-                tip: 'Send text/plain body with your POST request'
-            }, 400);
-        }
-        
-        const reader = req.body.getReader();
-        const decoder = new TextDecoder();
-        
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            requestBody += decoder.decode(value, { stream: true });
-        }
-        
-        if (!requestBody.trim()) {
-            return createCorsResponse({
-                error: 'Empty request body',
-                expected: 'text/plain body containing JSON string'
-            }, 400);
-        }
-
-        // Convert text/plain to JSON
-        let data;
-        try {
-            data = JSON.parse(requestBody);
-        } catch (parseError) {
-            return createCorsResponse({
-                error: 'Invalid JSON in text/plain body',
-                received: requestBody.slice(0, 100),
-                parseError: parseError.message
-            }, 400);
-        }
-
         const { action, userId } = data;
 
         if (!action || !userId) {
             return createCorsResponse({
                 error: 'Missing required fields',
                 required: ['action', 'userId'],
-                received: Object.keys(data)
+                received: Object.keys(data || {})
             }, 400);
         }
 
-        // Handle different actions
+        // Quick timeout check
+        if (Date.now() - startTime > 55000) { // 55 seconds safety margin
+            criticalLog('TIMEOUT-WARNING', `Request taking too long: ${Date.now() - startTime}ms`);
+            return createCorsResponse({
+                error: 'Request timeout prevention',
+                message: 'Please retry your request'
+            }, 408);
+        }
+
+        // Handle different actions with timeout protection
         switch (action) {
             case 'instant-match':
                 return handleInstantMatch(userId, data);
@@ -989,10 +987,19 @@ export default async function handler(req) {
 
     } catch (error) {
         criticalLog('ERROR', `Server error: ${error.message}`);
+        
+        // Enhanced error response for debugging
         return createCorsResponse({
             error: 'Internal server error',
-            message: 'Please try again later'
+            message: error.message,
+            type: error.constructor.name,
+            processing_time: Date.now() - startTime,
+            tip: 'Check request format and try again'
         }, 500);
     }
 }
-export const config = { runtime: 'edge' };
+
+// ✅ CRITICAL: Vercel Edge Runtime configuration
+export const config = { 
+    runtime: 'edge'
+}
