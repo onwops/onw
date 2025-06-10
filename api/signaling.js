@@ -1,4 +1,8 @@
 // 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - VERCEL EDGE FIXED
+
+// ✅ CRITICAL: Vercel Edge Runtime configuration
+export const config = {runtime: 'edge'}
+
 const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
@@ -1039,7 +1043,3 @@ export default async function handler(request) {
     }
 }
 
-// ✅ CRITICAL: Vercel Edge Runtime configuration
-export const config = { 
-    runtime: 'edge'
-}
