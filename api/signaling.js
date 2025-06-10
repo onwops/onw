@@ -280,8 +280,6 @@ function removeWaitingUser(userId) {
     if (user) {
         // Store user data for cleanup
         removedUsers.set(userId, user);
-        // Real-time index cleanup
-        waitingUsers.delete(userId);
         return true;
     }
     return false;
