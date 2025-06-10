@@ -2,9 +2,8 @@
 {
   "functions": {
     "api/**/*.js": {
-      "maxDuration": 10,
-      "memory": 512,
-      "runtime": "edge"
+      "maxDuration":60,
+      "memory": 512
     }
   },
   "headers": [
