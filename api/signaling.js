@@ -1,6 +1,6 @@
 // 🚀 WEBRTC SIGNALING SERVER - NODE.JS + REDIS LABS
 
-import { createClient } from 'redis';
+const { createClient } = require('redis');
 
 const ENABLE_DETAILED_LOGGING = false;
 
@@ -727,3 +727,221 @@ async function handleGetSignals(userId, data) {
         };
     }
 }
+async function handler(req, res) {
+    const startTime = Date.now();
+    
+    // ✅ THÊM: Global timeout protection
+    const globalTimeout = setTimeout(() => {
+        if (!res.headersSent) {
+            console.error('[GLOBAL-TIMEOUT] Function timeout after 25s');
+            res.status(408).json({
+                error: 'Function timeout',
+                message: 'Request took too long to process'
+            });
+        }
+    }, 25000); // 25 seconds
+    
+    try {
+        // CORS headers
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        
+        if (req.method === 'OPTIONS') {
+            clearTimeout(globalTimeout);
+            res.status(200).end();
+            return;
+        }
+        
+        if (req.method === 'GET') {
+            clearTimeout(globalTimeout);
+            
+            const debug = req.query.debug;
+            
+            if (debug === 'true') {
+                try {
+                    const waitingUsers = await getAllWaitingUsersFromRedis();
+                    
+                    res.status(200).json({
+                        status: 'redis-integrated-webrtc-signaling',
+                        runtime: 'nodejs18.x',
+                        version: '3.2-redis-nodejs-fixed',
+                        storage: 'Redis Labs',
+                        fixes: [
+                            'Node.js runtime compatibility',
+                            'Redis Labs integration', 
+                            'Fixed request body parsing',
+                            'Added timeout protection',
+                            'Memory usage optimization'
+                        ],
+                        stats: {
+                            waitingUsers: waitingUsers.size,
+                            redisConnected: !!redisClient
+                        },
+                        timestamp: Date.now()
+                    });
+                } catch (error) {
+                    res.status(200).json({
+                        status: 'redis-signaling-ready-debug-error',
+                        error: error.message,
+                        redisConnected: !!redisClient,
+                        timestamp: Date.now()
+                    });
+                }
+                return;
+            }
+            
+            res.status(200).json({ 
+                status: 'redis-nodejs-signaling-ready',
+                message: 'Redis + Node.js WebRTC signaling server ready!',
+                timestamp: Date.now()
+            });
+            return;
+        }
+        
+        if (req.method !== 'POST') {
+            clearTimeout(globalTimeout);
+            res.status(405).json({ error: 'POST required for signaling' });
+            return;
+        }
+        
+        // ✅ THÊM: Quick timeout check
+        if (Date.now() - startTime > 20000) {
+            clearTimeout(globalTimeout);
+            res.status(408).json({
+                error: 'Processing timeout',
+                message: 'Request took too long'
+            });
+            return;
+        }
+        
+        // Parse body with timeout
+        const data = await parseNodeJSBody(req);
+        const { action, userId } = data;
+        
+        // ✅ THÊM: Quick validation
+        if (!action) {
+            clearTimeout(globalTimeout);
+            console.log('[DEBUG] Missing action. Received:', Object.keys(data));
+            res.status(400).json({
+                error: 'Missing action field',
+                received: Object.keys(data || {}),
+                tip: 'action field is required'
+            });
+            return;
+        }
+        
+        if (!userId) {
+            clearTimeout(globalTimeout);
+            res.status(400).json({
+                error: 'Missing userId field',
+                tip: 'userId field is required'
+            });
+            return;
+        }
+        
+        // ✅ THÊM: Timeout check before processing
+        if (Date.now() - startTime > 22000) {
+            clearTimeout(globalTimeout);
+            res.status(408).json({
+                error: 'Pre-processing timeout',
+                message: 'Not enough time to process'
+            });
+            return;
+        }
+        
+        // Handle actions with individual timeouts
+        let result;
+        
+        try {
+            switch (action) {
+                case 'instant-match':
+                    result = await Promise.race([
+                        handleInstantMatch(userId, data),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('instant-match timeout')), 8000)
+                        )
+                    ]);
+                    break;
+                case 'send-signal':
+                    result = await Promise.race([
+                        handleSendSignal(userId, data),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('send-signal timeout')), 5000)
+                        )
+                    ]);
+                    break;
+                case 'get-signals':
+                    result = await Promise.race([
+                        handleGetSignals(userId, data),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('get-signals timeout')), 5000)
+                        )
+                    ]);
+                    break;
+                case 'p2p-connected':
+                    result = await Promise.race([
+                        handleP2pConnected(userId, data),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('p2p-connected timeout')), 3000)
+                        )
+                    ]);
+                    break;
+                case 'disconnect':
+                    result = await Promise.race([
+                        handleDisconnect(userId),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('disconnect timeout')), 3000)
+                        )
+                    ]);
+                    break;
+                default:
+                    result = {
+                        statusCode: 400,
+                        body: JSON.stringify({
+                            error: 'Unknown action',
+                            received: action,
+                            available: ['instant-match', 'get-signals', 'send-signal', 'p2p-connected', 'disconnect']
+                        })
+                    };
+            }
+        } catch (actionError) {
+            console.error(`[ACTION-ERROR] ${action}:`, actionError.message);
+            result = {
+                statusCode: 500,
+                body: JSON.stringify({
+                    error: `Action ${action} failed`,
+                    message: actionError.message,
+                    timeout: actionError.message.includes('timeout')
+                })
+            };
+        }
+
+        clearTimeout(globalTimeout);
+        
+        if (!res.headersSent) {
+            res.status(result.statusCode).json(JSON.parse(result.body));
+        }
+
+    } catch (error) {
+        clearTimeout(globalTimeout);
+        console.error('[MAIN-ERROR]', error.message);
+        
+        if (!res.headersSent) {
+            if (error.message.includes('timeout') || error.message.includes('Body too large')) {
+                res.status(408).json({
+                    error: 'Request timeout or too large',
+                    message: error.message,
+                    processing_time: Date.now() - startTime
+                });
+            } else {
+                res.status(500).json({
+                    error: 'Server error',
+                    message: error.message,
+                    processing_time: Date.now() - startTime
+                });
+            }
+        }
+    }
+}
+module.exports = handler;
