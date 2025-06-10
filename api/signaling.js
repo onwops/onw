@@ -1,7 +1,7 @@
 // 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - REDIS INTEGRATED
 
 export const config = {runtime: 'nodejs18.x'}
-
+console.log("build");
 const ENABLE_DETAILED_LOGGING = false;
 
 // ==========================================
