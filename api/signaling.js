@@ -1,7 +1,6 @@
 // 🚀 HYBRID-OPTIMIZED WebRTC Signaling Server - REDIS INTEGRATED
 
-// ✅ CRITICAL: Vercel Edge Runtime configuration
-export const config = {runtime: 'edge'}
+export const config = {runtime: 'nodejs18.x'}
 
 const ENABLE_DETAILED_LOGGING = false;
 
