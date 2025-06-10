@@ -250,14 +250,14 @@ async function findSimpleMatch(userId, userChatZone, userGender) {
 
 async function handleInstantMatch(userId, data) {
     const { userInfo, preferredMatchId, chatZone, gender } = data;
-    
+    /*
     if (!userId || typeof userId !== 'string') {
         return {
             statusCode: 400,
             body: JSON.stringify({ error: 'userId is required and must be string' })
         };
     }
-    
+    */
     console.log(`[INSTANT-MATCH] ${userId.slice(-8)} looking for partner`);
     
     // Check if user already in a match
@@ -494,7 +494,7 @@ export default async function handler(req, res) {
         // ✅ FIX: Node.js body parsing
         const data = req.body;
         const { action, userId } = data;
-
+        /*
         if (!action || !userId) {
             res.status(400).json({
                 error: 'Missing required fields',
@@ -503,7 +503,7 @@ export default async function handler(req, res) {
             });
             return;
         }
-
+        */
         // Handle different actions
         let result;
         switch (action) {
