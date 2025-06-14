@@ -1,7 +1,10 @@
-export const config = { runtime: 'edge'};
+// api/gateway.js
+export const config = {
+    runtime: 'edge',
+};
 
 export default async function handler(req) {
-
+    // CORS headers
     const corsHeaders = {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
