@@ -51,49 +51,68 @@ export default async function handler(req) {
         });
 
         // ==========================================
-        // ✅ CHỈNH SỬA: Chrome 149 trên Ubuntu 24.04 (LTS cao nhất)
+        // ✅ GIỮ CODE GỐC, NHƯNG FORWARD-ALL + FORCE OVERRIDE
         // ==========================================
         
-        const requestHeaders = new Headers();
+        // Clone toàn bộ headers từ client request
+        const requestHeaders = new Headers(req.headers);
+
+        // Loại bỏ hop-by-hop headers và các header dễ leak proxy/client IP
+        const blockedRequestHeaders = [
+            'host',
+            'content-length',
+            'connection',
+            'keep-alive',
+            'proxy-authenticate',
+            'proxy-authorization',
+            'proxy-connection',
+            'te',
+            'trailer',
+            'transfer-encoding',
+            'upgrade',
+            'forwarded',
+            'x-forwarded-for',
+            'x-forwarded-host',
+            'x-forwarded-port',
+            'x-forwarded-proto',
+            'x-real-ip',
+            'via',
+            'cf-connecting-ip',
+            'cf-ipcountry',
+            'cf-ray',
+            'cdn-loop'
+        ];
+
+        blockedRequestHeaders.forEach(headerName => {
+            requestHeaders.delete(headerName);
+        });
+
+        // ==========================================
+        // ✅ FORCE OVERRIDE các header muốn giả lập browser
+        // ==========================================
         
-        // ✅ User-Agent: Chrome 149 trên Ubuntu 24.04 (LTS Noble Numbat) [web:144][web:153][web:155]
-        requestHeaders.set('User-Agent', 
-            'Mozilla/5.0 (X11; Ubuntu 24.04; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
+        requestHeaders.set(
+            'User-Agent',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
         );
-        
-        // Accept: Chrome 149 standard
-        requestHeaders.set('Accept', 
+
+        requestHeaders.set(
+            'Accept',
             'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
         );
-        
-        // Accept-Language: en-US (Mỹ)
+
         requestHeaders.set('Accept-Language', 'en-US,en;q=0.9');
-        
-        // Accept-Encoding: Standard Chrome 149 Linux
         requestHeaders.set('Accept-Encoding', 'gzip, deflate, br');
-        
-        // Connection: Keep-Alive
-        requestHeaders.set('Connection', 'keep-alive');
-        
-        // Sec-Ch-Ua: Chrome 149 Linux device hints [web:144]
-        requestHeaders.set('Sec-Ch-Ua', 
+        requestHeaders.set('Cache-Control', 'no-cache');
+        requestHeaders.set('Pragma', 'no-cache');
+        requestHeaders.set('Upgrade-Insecure-Requests', '1');
+
+        requestHeaders.set(
+            'Sec-CH-UA',
             '"Chromium";v="149", "Not;A Brand";v="99"'
         );
-        
-        // Sec-Ch-Ua-Platform: Ubuntu (Linux)
-        requestHeaders.set('Sec-Ch-Ua-Platform', '"Ubuntu"');
-        
-        // Sec-Ch-Ua-Platform-Version: 24.04
-        requestHeaders.set('Sec-Ch-Ua-Platform-Version', '"24.04"');
-        
-        // Upgrade-Insecure-Requests: Chrome standard
-        requestHeaders.set('Upgrade-Insecure-Requests', '1');
-        
-        // Cache-Control: No-cache
-        requestHeaders.set('Cache-Control', 'no-cache');
-        
-        // Pragma: No-cache
-        requestHeaders.set('Pragma', 'no-cache');
+        requestHeaders.set('Sec-CH-UA-Mobile', '?0');
+        requestHeaders.set('Sec-CH-UA-Platform', '"Linux"');
 
         const fetchOptions = {
             method: req.method,
